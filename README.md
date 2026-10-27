@@ -115,6 +115,7 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `--draft-policy POLICY` | engine default | DFlash2 block policy: `fixed` or `adaptive` |
 | `--image IMG` | `ghcr.io/gufo-org/toolboxes/gufo-runtime:latest` | Runtime image |
 | `--no-register` | — | Container only, skip `models.json` |
+| `--tailscale` | off | Expose the endpoint on your tailnet via `tailscale serve` (see below) |
 
 ## Speculative decoding
 
@@ -161,6 +162,42 @@ Measured on a Strix Halo (Strix Point X1), Qwen3.8-27B:
 
 The container's load log confirms the backend:
 `podman logs <name> | grep -o 'speculative=[a-z0-9]*'`.
+
+## Exposing an endpoint on your tailnet
+
+`gufo run <model> --tailscale` publishes the OpenAI endpoint through
+[Tailscale Serve](https://tailscale.com/kb/1312/serve) instead of leaving it
+loopback-only:
+
+```
+✔ ready: model id '...' on http://127.0.0.1:13306/v1
+✔ tailnet: https://rogtablet.tail47c42a.ts.net:13306/v1 — tailnet-only, no auth (gate with ACLs); removed on gufo stop
+```
+
+Peers on your tailnet then use `https://<node>.<tailnet>.ts.net:<port>/v1` as
+the base URL — TLS via the node's auto-provisioned `ts.net` certificate, and
+the endpoint stays invisible outside the tailnet. `gufo status` shows the
+tailnet URL when a model is exposed, and `gufo stop` removes the serve entry
+automatically.
+
+**One-time setup** — changing serve config requires operator rights (the
+container and registration work without this; only the tailnet exposure needs
+it):
+
+```sh
+sudo tailscale set --operator=$USER   # once, as your normal user
+```
+
+Notes:
+
+- The endpoint itself has **no authentication** — Tailscale's boundary is your
+  ACLs. Restrict which tailnet users/devices may reach the port if your tailnet
+  is shared.
+- Each exposed model gets its own port (the container's port), so multiple
+  models can be exposed simultaneously.
+- Exposed ports work like any other `serve` entry: they persist in the
+  tailscale daemon until removed (`gufo stop`, or
+  `sudo tailscale serve --https=<port> off`).
 
 ## Watching tokens/sec
 

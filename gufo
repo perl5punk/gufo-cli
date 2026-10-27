@@ -172,6 +172,36 @@ gpu_flags() {
   GPU_FLAGS+=(--ulimit memlock=-1)
 }
 
+# ------------------------------------------------------- tailscale serve ---
+# Exposes the loopback API port on the tailnet via 'tailscale serve' (HTTPS
+# with the node's MagicDNS cert). Changing serve config requires operator
+# rights once: `sudo tailscale set --operator=$USER`.
+ts_dns_name() {
+  tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//'
+}
+
+# true if a serve handler currently proxies http(s)://127.0.0.1:<port>
+serve_has_port() {
+  tailscale serve status --json 2>/dev/null \
+    | jq -e --arg p "$1" \
+      '[.Web[]?.Handlers[]?.Proxy?] | any(test("127\\.0\\.0\\.1:" + $p + "$"))' \
+    >/dev/null 2>&1
+}
+
+serve_url() { # <port>
+  local d
+  d=$(ts_dns_name)
+  if [ -n "$d" ]; then
+    printf 'https://%s:%s/v1\n' "$d" "$1"
+  else
+    printf 'http://%s:%s/v1\n' "$(tailscale ip -4)" "$1"
+  fi
+}
+
+serve_expose() { # <port>
+  tailscale serve --bg --https="$1" "http://127.0.0.1:$1" >/dev/null 2>&1
+}
+
 # -------------------------------------------------------- models.json -------
 require_models_json() {
   [ -f "$PI_MODELS_JSON" ] || die "models.json not found at $PI_MODELS_JSON"
@@ -264,6 +294,7 @@ cmd_run() {
   local model_q="" port="" name="" image="$GUFO_IMAGE" register=1
   local ctx=$GUFO_CTX_DEFAULT max=$GUFO_MAX_DEFAULT ram_cache=$GUFO_RAM_CACHE_DEFAULT
   local spec_mode=auto spec_path="" draft_tokens="" draft_policy=""
+  local tailscale=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --port)        port="${2:-}"; shift 2 ;;
@@ -277,6 +308,7 @@ cmd_run() {
       --draft-tokens) draft_tokens="${2:-}"; shift 2 ;;
       --draft-policy) draft_policy="${2:-}"; shift 2 ;;
       --no-register) register=0; shift ;;
+      --tailscale)   tailscale=1; shift ;;
       -h|--help)     usage; exit 0 ;;
       -*)            die "unknown option: $1" ;;
       *)
@@ -293,6 +325,10 @@ cmd_run() {
     die "invalid --speculative '$spec_mode' (expected auto, off, mtp, dflash2 or dspark)"
   fi
   command -v podman >/dev/null || die "podman not found in PATH"
+  if [ "$tailscale" = 1 ]; then
+    command -v tailscale >/dev/null || die "tailscale not found in PATH"
+    tailscale ip -4 >/dev/null 2>&1 || die "tailscale is not up (tailscale status)"
+  fi
 
   local path
   path=$(resolve_model "$model_q") || die "model not found: $model_q (see: gufo models)"
@@ -411,6 +447,16 @@ cmd_run() {
   else
     info "skipped registration (--no-register)"
   fi
+
+  if [ "$tailscale" = 1 ]; then
+    if serve_expose "$port"; then
+      ok "tailnet: $(serve_url "$port") — tailnet-only, no auth (gate with ACLs); removed on gufo stop"
+    else
+      warn "--tailscale: could not update tailscale serve config."
+      warn "  one-time fix:  sudo tailscale set --operator=$USER"
+      warn "  or manually:   sudo tailscale serve --bg --https=$port http://127.0.0.1:$port"
+    fi
+  fi
 }
 
 cmd_stop() {
@@ -445,9 +491,18 @@ cmd_stop() {
   fi
 
   for n in "${names[@]}"; do
+    local tport
+    tport=$(container_host_port "$n")
     podman stop -t 15 "$n" >/dev/null 2>&1 || true
     podman rm -f "$n" >/dev/null 2>&1 || true
     info "stopped + removed: $n"
+    if [ -n "$tport" ] && command -v tailscale >/dev/null 2>&1 && serve_has_port "$tport"; then
+      if tailscale serve --https="$tport" off >/dev/null 2>&1; then
+        info "tailnet: removed serve entry for port $tport"
+      else
+        warn "could not remove tailnet serve entry for port $tport (try: sudo tailscale serve --https=$tport off)"
+      fi
+    fi
     if [ "$keep_config" != 1 ] && [ -f "$PI_MODELS_JSON" ] && is_registered "$n"; then
       unregister_model "$n"
       info "removed provider '$n' from models.json"
@@ -469,6 +524,9 @@ cmd_status() {
         id=$(served_model_id "$port") || true
         if [ -n "$id" ]; then
           printf '    model: %s\n' "$id"
+        fi
+        if command -v tailscale >/dev/null 2>&1 && serve_has_port "$port"; then
+          printf '    tailnet: %s\n' "$(serve_url "$port")"
         fi
       fi
       if [ -f "$PI_MODELS_JSON" ] && is_registered "$n"; then
@@ -618,6 +676,9 @@ usage: gufo <command> [args]
       --draft-tokens N            speculative draft cap per step, 1-7 (default 7)
       --draft-policy POLICY       DFlash2 block policy: fixed or adaptive (default adaptive)
       --no-register               container only, skip models.json
+      --tailscale                 expose endpoint on the tailnet via 'tailscale serve'
+                                  (https://<node>.<tailnet>.ts.net:<port>/v1; auto-cleaned on stop;
+                                  needs operator rights once: sudo tailscale set --operator=$USER)
       --image IMG                 runtime image (default: $GUFO_IMAGE)
   stop <model|name|all> [--keep-config]
                                   stop + remove container (and its provider)
