@@ -295,6 +295,7 @@ cmd_run() {
   local model_q="" port="" name="" image="$GUFO_IMAGE" register=1
   local ctx=$GUFO_CTX_DEFAULT max=$GUFO_MAX_DEFAULT ram_cache=$GUFO_RAM_CACHE_DEFAULT
   local spec_mode=auto spec_path="" draft_tokens="" draft_policy=""
+  local served_name="" api_key=""
   local tailscale=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -308,6 +309,8 @@ cmd_run() {
                      if [ $# -gt 0 ] && [[ "$1" != -* ]]; then spec_path="$1"; shift; fi ;;
       --draft-tokens) draft_tokens="${2:-}"; shift 2 ;;
       --draft-policy) draft_policy="${2:-}"; shift 2 ;;
+      --served-name|--served-model-name) served_name="${2:-}"; shift 2 ;;
+      --api-key)     api_key="${2:-}"; shift 2 ;;
       --no-register) register=0; shift ;;
       --tailscale)   tailscale=1; shift ;;
       -h|--help)     usage; exit 0 ;;
@@ -320,7 +323,7 @@ cmd_run() {
     esac
   done
   if [ -z "$model_q" ]; then
-    die "usage: gufo run <model> [--port N] [--ctx N] [--max N] [--ram-cache BYTES] [--speculative MODE [sidecar.gguf]] [--no-register]"
+    die "usage: gufo run <model> [--port N] [--ctx N] [--max N] [--ram-cache BYTES] [--speculative MODE [sidecar.gguf]] [--served-name ID] [--api-key KEY] [--no-register]"
   fi
   if [[ ! "$spec_mode" =~ ^(auto|off|mtp|dflash2|dspark)$ ]]; then
     die "invalid --speculative '$spec_mode' (expected auto, off, mtp, dflash2 or dspark)"
@@ -413,19 +416,32 @@ cmd_run() {
     SPEC_ARGS+=(--draft-policy "$draft_policy")
   fi
 
+  # Model identity + auth exposed by the container. Callers that publish these
+  # endpoints elsewhere (lemonade-backend/gufo-lemonade) want a stable id rather
+  # than whatever general.name the GGUF happens to carry.
+  local SERVE_IDENTITY_ARGS=()
+  if [ -n "$served_name" ]; then
+    [[ "$served_name" =~ [[:space:]] ]] && die "--served-name must not contain whitespace"
+    SERVE_IDENTITY_ARGS+=(--served-model-name "$served_name")
+  fi
+  if [ -n "$api_key" ]; then
+    SERVE_IDENTITY_ARGS+=(--api-key "$api_key")
+  fi
+
   gpu_flags
   info "Starting $name"
   info "  model:  $path"
   info "  spec:   $spec_label"
   info "  image:  $image"
   info "  port:   127.0.0.1:$port"
+  [ -n "$served_name" ] && info "  id:     $served_name (served model name)"
   if ! podman run -d --name "$name" \
     "${GPU_FLAGS[@]}" \
     -v "${root}:/models:ro,z" \
     -p 127.0.0.1:${port}:${port} \
     "$image" \
     gufo serve llm --model "$cpath" --host 0.0.0.0 --port "$port" \
-      -c "$ctx" --cache-ram-bytes "$ram_cache" "${SPEC_ARGS[@]}" >/dev/null; then
+      -c "$ctx" --cache-ram-bytes "$ram_cache" "${SPEC_ARGS[@]}" "${SERVE_IDENTITY_ARGS[@]}" >/dev/null; then
     die "podman run failed"
   fi
 
@@ -676,6 +692,10 @@ usage: gufo <command> [args]
                                   mtp, dflash2 or dspark; optional explicit sidecar path
       --draft-tokens N            speculative draft cap per step, 1-7 (default 7)
       --draft-policy POLICY       DFlash2 block policy: fixed or adaptive (default adaptive)
+      --served-name ID            model id exposed by the OpenAI API (default: the name
+                                  baked into the GGUF); use a stable id when another app
+                                  lists models and forwards requests back to us
+      --api-key KEY               require this bearer key in the container
       --no-register               container only, skip models.json
       --tailscale                 expose endpoint on the tailnet via 'tailscale serve'
                                   (https://<node>.<tailnet>.ts.net:<port>/v1; auto-cleaned on stop;
