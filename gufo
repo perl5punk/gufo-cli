@@ -146,9 +146,9 @@ container_running() {
   [ "$st" = "running" ]
 }
 
-# Port the container publishes on the host (podman port: "127.0.0.1:13306->0.0.0.0:13306")
+# Port the container publishes on the host (podman port: "13307/tcp -> 127.0.0.1:13307")
 container_host_port() {
-  podman port "$1" 2>/dev/null | head -1 | awk -F'->' '{print $1}' | grep -oE '[0-9]+$' || true
+  podman port "$1" 2>/dev/null | head -1 | awk -F'->' '{print $NF}' | grep -oE '[0-9]+$' || true
 }
 
 # Device passthrough + group access, per gufo-org docs (crun/runc-safe: numeric gids)
