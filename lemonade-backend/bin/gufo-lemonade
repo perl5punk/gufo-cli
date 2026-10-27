@@ -1,0 +1,1453 @@
+#!/usr/bin/env python3
+"""
+gufo-lemonade — bridge between Lemonade Server and Gufo.
+
+Lemonade backends are compiled into `lemond` at build time, so a GGUF engine
+that Lemonade does not ship cannot be added out of process... except through
+the `cloud` recipe, which routes any OpenAI-compatible base URL and surfaces
+what it lists at <base>/models in /v1/models, the desktop app and every client
+of the server.
+
+Gufo already speaks that API (one container per model, `gufo run <model>`), but
+each container listens on its own auto-assigned port and only exists once it is
+started. This bridge is the missing piece: one stable endpoint that
+
+  * advertises every GGUF found in your models directories (so the models show
+    up in Lemonade before anything is loaded),
+  * starts the right container on demand by calling the `gufo` CLI, and
+  * proxies chat/completions traffic to it, streaming included.
+
+Register it once:
+
+    lemonade cloud install gufo --base-url http://127.0.0.1:13399/v1 \
+        --api-key gufo-local --allow-insecure-http
+
+Standard library only; Python 3.8+.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hmac
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+PROG = "gufo-lemonade"
+VERSION = "1.0.0"
+
+CONFIG_PATH = Path(
+    os.environ.get(
+        "GUFO_LEMONADE_CONFIG",
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        / "gufo-lemonade"
+        / "config.json",
+    )
+)
+
+DEFAULTS = {
+    # --- bridge endpoint -----------------------------------------------------
+    "host": "127.0.0.1",
+    "port": 13399,
+    # --- Lemonade -------------------------------------------------------------
+    # Provider name becomes the model namespace: gufo.<Model>.
+    "provider": "gufo",
+    "lemond_url": "http://127.0.0.1:13305",
+    # --- model discovery ------------------------------------------------------
+    "models_dirs": ["~/models", "~/.local/share/gufo/models"],
+    "max_depth": 4,
+    # Draft/speculative sidecars are not standalone models; hide them from the
+    # catalog (they are picked up automatically by `gufo run`).
+    "hide_sidecars": True,
+    # --- container launch (passed on to the gufo CLI) -------------------------
+    "gufo_bin": "gufo",
+    # Serve each container under the id we publish, instead of whatever
+    # general.name the GGUF carries. Keeps Lemonade's requests addressable.
+    "use_served_names": True,
+    # Optional: require this bearer key inside the containers (they bind to
+    # 127.0.0.1 by default, so this is only useful if you forward the bridge).
+    "container_api_key": "",
+    "port_start": 13400,
+    "ctx": 131072,
+    "ram_cache_bytes": 4 * 1024 * 1024 * 1024,
+    "speculative": "auto",
+    # --- Lemonade registration ------------------------------------------------
+    # The cloud recipe insists on an API key; Gufo ignores whatever it gets. The
+    # key only has to be visible to lemond, and lemond keeps CLI-supplied keys in
+    # memory only — so the bridge re-asserts its own registration on start and on
+    # an interval. That keeps 'gufo.*' models published after a lemond restart
+    # without writing anything to /etc or needing root.
+    "api_key": "gufo-local",
+    "auto_register": True,
+    "register_interval_min": 15,
+    # Rescan the model directories this often, so dropping a new GGUF file into
+    # ~/models publishes it in Lemonade without restarting anything.
+    "scan_interval_seconds": 60,
+    # --- lifecycle ------------------------------------------------------------
+    # How long a request waits for a cold model before answering 503. Keep it
+    # below lemond's own cloud timeout (300 s) so the client gets this message
+    # rather than an opaque gateway timeout. The load keeps running in the
+    # background; the retry after it finishes succeeds.
+    "start_wait_seconds": 180,
+    # 0 = keep every started model loaded. 1 = one model at a time (LRU), which
+    # is the safe default for 30 GB-class models.
+    "max_loaded": 1,
+    # Free memory *before* launching a container instead of after: with a big
+    # model resident there is often no room for the next one until the previous
+    # one is stopped, and llama.cpp would just fail to allocate.
+    "evict_before_start": True,
+    # Do not retry a model that failed to load for this long (seconds).
+    "retry_backoff_seconds": 60,
+    # 0 = never evict on idle. Minutes.
+    "idle_timeout_min": 0,
+    # Models to load when the bridge starts, so the first chat is warm.
+    "autostart": [],
+    # --- capability hints sent to Lemonade ------------------------------------
+    # Lemonade gates request inputs on these labels. Report what the engine
+    # actually serves; image input is opt-in per model below.
+    "supports": {"tools": True, "reasoning": True, "image_input": False},
+    # Per-model overrides: {"<Model id>": {"ctx": 32768, "image_input": true,
+    #                                       "hidden": true, "title": "..."}}
+    "model_overrides": {},
+}
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))  # deep copy of the defaults
+    if CONFIG_PATH.is_file():
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as fh:
+                user = json.load(fh)
+        except (OSError, ValueError) as exc:
+            log(f"warning: ignoring unreadable {CONFIG_PATH}: {exc}")
+            user = {}
+        for key, value in (user or {}).items():
+            if key == "supports" and isinstance(value, dict):
+                cfg["supports"].update(value)
+            elif key == "model_overrides" and isinstance(value, dict):
+                cfg["model_overrides"].update(value)
+            else:
+                cfg[key] = value
+    # Environment overrides, handy for systemd drop-ins.
+    env_map = {
+        "GUFO_LEMONADE_HOST": ("host", str),
+        "GUFO_LEMONADE_PORT": ("port", int),
+        "GUFO_LEMONADE_PROVIDER": ("provider", str),
+        "LEMOND_URL": ("lemond_url", str),
+        "GUFO_MODELS_DIR": ("models_dirs", lambda v: [v]),
+        "GUFO_BIN": ("gufo_bin", str),
+        "GUFO_LEMONADE_CTX": ("ctx", int),
+        "GUFO_LEMONADE_MAX_LOADED": ("max_loaded", int),
+        "GUFO_LEMONADE_IDLE_MIN": ("idle_timeout_min", int),
+        "GUFO_LEMONADE_START_WAIT": ("start_wait_seconds", int),
+        "GUFO_LEMONADE_API_KEY": ("api_key", str),
+    }
+    for env, (key, cast) in env_map.items():
+        if os.environ.get(env):
+            try:
+                cfg[key] = cast(os.environ[env])
+            except ValueError:
+                log(f"warning: invalid value for {env}, using {cfg[key]}")
+    cfg["models_dirs"] = [
+        str(Path(d).expanduser()) for d in cfg.get("models_dirs", []) if d
+    ]
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# GGUF header parsing (context length + name), so advertised models carry a
+# realistic context window instead of a guess.
+# ---------------------------------------------------------------------------
+
+# GGUF value types (spec v3): id -> (struct char, byte size)
+GGUF_TYPES = {
+    0: ("B", 1), 1: ("b", 1), 2: ("H", 2), 3: ("h", 2),
+    4: ("I", 4), 5: ("i", 4), 6: ("f", 4), 7: ("B", 1),
+    10: ("Q", 8), 11: ("q", 8),
+}
+GGUF_STRING, GGUF_ARRAY = 8, 9
+
+KEEP_KEYS = ("general.name", "general.architecture", "general.type")
+
+
+def read_gguf_metadata(path: Path, max_bytes: int = 16 * 1024 * 1024) -> dict:
+    """Best-effort read of a GGUF header's key/value section.
+
+    Only the handful of keys the bridge cares about are kept, but every value is
+    consumed exactly, so the walk stays in sync. Anything unexpected stops the
+    walk and the keys found so far are returned — a model we know little about
+    is still a model worth listing.
+    """
+    meta: dict = {}
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(4) != b"GGUF":
+                return {}
+            if struct.unpack("<I", fh.read(4))[0] < 2:
+                return {}
+            fh.read(8)                                   # n_tensors
+            n_kv = struct.unpack("<Q", fh.read(8))[0]
+            if n_kv > 100_000:                           # implausible: mis-parse
+                return {}
+
+            def read_string() -> bytes:
+                length = struct.unpack("<Q", fh.read(8))[0]
+                if length > 64 * 1024 * 1024:
+                    raise ValueError("string too long")
+                blob = fh.read(length)
+                if len(blob) != length:
+                    raise ValueError("truncated string")
+                return blob
+
+            def read_value(t: int):
+                if t == GGUF_STRING:
+                    return read_string().decode("utf-8", "replace")
+                if t == GGUF_ARRAY:
+                    item_type = struct.unpack("<I", fh.read(4))[0]
+                    count = struct.unpack("<Q", fh.read(8))[0]
+                    if count > 8_000_000:
+                        raise ValueError("implausible array length")
+                    if item_type == GGUF_STRING:
+                        for _ in range(count):           # token tables: walk, don't keep
+                            read_string()
+                        return count
+                    fmt = GGUF_TYPES.get(item_type)
+                    if not fmt or not fmt[1]:
+                        raise ValueError("unsupported array item type")
+                    blob = fh.read(count * fmt[1])
+                    if len(blob) != count * fmt[1]:
+                        raise ValueError("truncated array")
+                    if count > 4096:
+                        return count
+                    return list(struct.unpack(f"<{count}{fmt[0]}", blob))
+                fmt = GGUF_TYPES.get(t)
+                if not fmt:
+                    raise ValueError(f"unknown GGUF value type {t}")
+                return struct.unpack(f"<{fmt[0]}", fh.read(fmt[1]))[0]
+
+            for _ in range(n_kv):
+                if fh.tell() > max_bytes:
+                    break
+                key = read_string().decode("utf-8", "replace")
+                value = read_value(struct.unpack("<I", fh.read(4))[0])
+                if key.endswith(".context_length") or key in KEEP_KEYS:
+                    meta[key] = value
+    except Exception:  # noqa: BLE001 - a header we cannot finish is not an error
+        pass
+    return meta
+
+
+def gguf_context_length(meta: dict) -> int:
+    for key, value in meta.items():
+        if key.endswith(".context_length") and isinstance(value, int) and value > 0:
+            return value
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Model catalog
+# ---------------------------------------------------------------------------
+
+SHARD_RE = re.compile(r"^(?P<base>.+?)[-__.](?P<idx>\d{4,})-of-(?P<total>\d{4,})$", re.I)
+SIDECAR_RE = re.compile(r"(^|[-_.])(mtp[-_.].*|.*dflash2.*|.*dspark.*|.*mmproj.*)$", re.I)
+
+
+def normalize(name: str) -> str:
+    """Separator/case-insensitive form, for forgiving model lookups."""
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def sanitize_id(name: str) -> str:
+    """Readable, stable id from a file/dir name (dots and dashes preserved)."""
+    out = re.sub(r"[^A-Za-z0-9._+-]+", "-", name).strip("-.")
+    return out or "model"
+
+
+def container_name_for(stem: str) -> str:
+    """Mirror `gufo`'s slugify() so container names match what the CLI creates."""
+    s = stem.lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    s = re.sub(r"-\d+-of-\d+$", "", s)
+    return "gufo-" + s[:48]
+
+
+class ModelEntry:
+    def __init__(self, model_id: str, title: str, path: Path, size: int, meta: dict):
+        self.id = model_id
+        self.title = title
+        self.path = path
+        self.size = size
+        self.meta = meta
+        self.container = container_name_for(path.name.rsplit(".", 1)[0])
+        self.served_id = ""      # id reported by a running container
+        self.port = 0
+        self.running = False
+        self.last_used = 0.0
+        arch = meta.get("general.architecture") or ""
+        self.arch = arch if isinstance(arch, str) else ""
+        ctx = gguf_context_length(meta)
+        self.native_ctx = ctx
+
+    def effective_ctx(self, cfg: dict) -> int:
+        """Context window to launch with: an explicit override wins, otherwise
+        the configured cap is clipped to what the checkpoint was trained for
+        (no point allocating KV for 128k on a 40k model)."""
+        ov = cfg.get("model_overrides", {}).get(self.id, {})
+        if ov.get("ctx"):
+            return int(ov["ctx"])
+        cap = int(cfg.get("ctx") or 0)
+        if cap and self.native_ctx:
+            return min(cap, self.native_ctx)
+        return cap or self.native_ctx or 0
+
+    def to_model_card(self, cfg: dict) -> dict:
+        supports = cfg.get("supports", {})
+        ov = cfg.get("model_overrides", {}).get(self.id, {})
+        ctx = self.effective_ctx(cfg)
+        caps = ["chat"]
+        if ov.get("tools", supports.get("tools", False)):
+            caps.append("tools")
+        if ov.get("reasoning", supports.get("reasoning", False)):
+            caps.append("reasoning")
+        image_input = bool(ov.get("image_input", supports.get("image_input", False)))
+        card = {
+            "id": self.id,
+            "object": "model",
+            "created": int(self.path.stat().st_mtime) if self.path.exists() else 0,
+            "owned_by": "gufo",
+            "capabilities": caps,
+            "supported_parameters": ["tools", "tool_choice", "temperature", "streaming"],
+            "supports_tools": bool(ov.get("tools", supports.get("tools", False))),
+            "supports_reasoning": bool(ov.get("reasoning", supports.get("reasoning", False))),
+            "supports_image_input": image_input,
+            "architecture": {
+                "modality": "text+image->text" if image_input else "text->text",
+                "input_modalities": ["text", "image"] if image_input else ["text"],
+                "tokenizer": "bytepair",
+            },
+            "gufo": {
+                "state": "running" if self.running else "stopped",
+                "container": self.container,
+                "port": self.port,
+                "path": str(self.path),
+                "size_gb": round(self.size / 1e9, 2),
+                "architecture": self.arch,
+            },
+        }
+        if ctx > 0:
+            card["context_length"] = ctx
+        return card
+
+
+class Catalog:
+    """Discovers GGUF files and maps them to stable Lemonade-facing ids."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.entries: list[ModelEntry] = []
+        self.by_id: dict[str, ModelEntry] = {}
+        self.scan()
+
+    def scan(self) -> list[ModelEntry]:
+        dirs = [Path(d) for d in self.cfg["models_dirs"]]
+        found: dict[str, tuple[Path, int, dict]] = {}  # base stem -> (path, size, meta)
+        hide_sidecars = bool(self.cfg.get("hide_sidecars", True))
+        for root in dirs:
+            if not root.is_dir():
+                continue
+            for path in sorted(root.glob("**/*.gguf")):
+                rel = path.relative_to(root)
+                if len(rel.parts) > int(self.cfg.get("max_depth", 4)):
+                    continue
+                if not path.is_file():
+                    continue
+                stem = path.name[:-5]
+                shard = SHARD_RE.match(stem)
+                base = shard.group("base") if shard else stem
+                if hide_sidecars and SIDECAR_RE.match(base):
+                    continue
+                # Skip non-first shards, and let the first shard of a set win.
+                if shard and int(shard.group("idx")) != 1:
+                    if base in found:
+                        continue
+                if shard:
+                    size = 0
+                    for sibling in path.parent.glob(base + "*.gguf"):
+                        match = SHARD_RE.match(sibling.stem)
+                        if match and match.group("base") == base and sibling.is_file():
+                            size += sibling.stat().st_size
+                else:
+                    size = path.stat().st_size
+                if base in found:
+                    if not shard:
+                        log(f"note: ignoring duplicate '{base}.gguf' at {path}")
+                        continue
+                    # A different shard set with the same base: keep the bigger one.
+                    if size <= found[base][1]:
+                        continue
+                found[base] = (path, size, read_gguf_metadata(path))
+
+        overrides = self.cfg.get("model_overrides", {})
+        entries: list[ModelEntry] = []
+        taken: set[str] = set()
+        for base, (path, size, meta) in sorted(found.items()):
+            title = overrides.get(base, {}).get("title") or base
+            model_id = sanitize_id(title)
+            if model_id in taken:  # same stem in two directories
+                parent = sanitize_id(path.parent.name)
+                model_id = sanitize_id(f"{parent}-{model_id}")
+                n = 2
+                while model_id in taken:
+                    model_id = sanitize_id(f"{parent}-{model_id}-{n}")
+                    n += 1
+            taken.add(model_id)
+            entries.append(ModelEntry(model_id, title, path, size, meta))
+
+        with self.lock:
+            previous = self.by_id
+            # Preserve live state across rescans for entries whose path is unchanged.
+            for entry in entries:
+                old = previous.get(entry.id)
+                if old and old.path == entry.path:
+                    entry.running = old.running
+                    entry.port = old.port
+                    entry.last_used = old.last_used
+                    entry.served_id = old.served_id
+            self.entries = entries
+            self.by_id = {e.id: e for e in entries}
+        return entries
+
+    def get(self, name: str) -> ModelEntry | None:
+        if not name:
+            return None
+        with self.lock:
+            entry = self.by_id.get(name)
+            if entry:
+                return entry
+            bare = name.split(".", 1)[1] if name.startswith(self.cfg["provider"] + ".") else name
+            entry = self.by_id.get(bare)
+            if entry:
+                return entry
+            lowered = normalize(bare)
+            for cand in self.entries:
+                if normalize(cand.id) == lowered:
+                    return cand
+                if normalize(cand.container) == lowered:
+                    return cand
+                if normalize(cand.served_id) == lowered:
+                    return cand
+            matches = [c for c in self.entries if lowered and lowered in normalize(c.id)]
+            return matches[0] if len(matches) == 1 else None
+
+
+# ---------------------------------------------------------------------------
+# Container lifecycle, driven through the gufo CLI
+# ---------------------------------------------------------------------------
+
+def run(cmd: list[str], timeout: int | None = None, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def free_port(start: int) -> int:
+    for port in range(start, start + 128):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"no free port found from {start}")
+
+
+def bearer_ok(header: str | None, want: str) -> bool:
+    """True when `Authorization: Bearer <want>` is present (or nothing is required)."""
+    if not want:
+        return True
+    got = (header or "").strip()
+    if not got.lower().startswith("bearer "):
+        return False          # fail closed: the OpenAI wire format requires the scheme
+    # bytes: compare_digest rejects non-ASCII str, and headers can carry anything
+    return hmac.compare_digest(got[7:].strip().encode("utf-8", "replace"),
+                             want.encode("utf-8"))
+
+
+def http_json(url: str, payload: dict | None = None, timeout: float = 5.0,
+              bearer: str = ""):
+    data = None if payload is None else json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method="POST" if data else "GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+class Engine:
+    """Owns the gufo containers behind the bridge."""
+
+    def __init__(self, cfg: dict, catalog: Catalog):
+        self.cfg = cfg
+        self.catalog = catalog
+        self.lock = threading.RLock()
+        self.starting: dict[str, threading.Thread] = {}
+        self.ready: dict[str, threading.Event] = {}
+        self.errors: dict[str, str] = {}
+        self.failed_at: dict[str, float] = {}
+
+    # -- state ----------------------------------------------------------------
+    def container_port(self, name: str) -> int:
+        proc = run(["podman", "port", name], timeout=15)
+        if proc.returncode != 0:
+            return 0
+        match = re.search(r"(\d+)\s*$", (proc.stdout or "").strip().splitlines()[0] or "")
+        return int(match.group(1)) if match else 0
+
+    def container_state(self, name: str) -> str:
+        proc = run(
+            ["podman", "inspect", "-f", "{{.State.Status}}", name],
+            timeout=15,
+        )
+        return (proc.stdout or "").strip() if proc.returncode == 0 else "missing"
+
+    def probe(self, port: int) -> str:
+        """Return the model id served on <port>, or "" when it is not ready."""
+        try:
+            data = http_json(f"http://127.0.0.1:{port}/v1/models", timeout=5,
+                             bearer=str(self.cfg.get("container_api_key") or ""))
+        except Exception:  # noqa: BLE001
+            return ""
+        items = data.get("data") or []
+        return str(items[0].get("id")) if items else ""
+
+    def adopt_running(self) -> None:
+        """Adopt containers that are already up (bridge restart, `gufo run` by hand)."""
+        proc = run(["podman", "ps", "--filter", "name=gufo-", "--format", "{{.Names}}"], timeout=20)
+        if proc.returncode != 0:
+            return
+        names = [n.strip() for n in (proc.stdout or "").splitlines() if n.strip()]
+        for entry in self.catalog.entries:
+            if entry.container in names:
+                port = self.container_port(entry.container)
+                served = self.probe(port) if port else ""
+                if served:
+                    entry.running = True
+                    entry.port = port
+                    entry.served_id = served
+                    log(f"adopted running container {entry.container} on :{port} ({served})")
+
+    # -- start / stop ---------------------------------------------------------
+    def ensure(self, entry: ModelEntry, wait: float, force: bool = False) -> tuple[str, str]:
+        """Return (state, message); state is running | loading | error."""
+        with self.lock:
+            if entry.running and entry.port and self.probe(entry.port):
+                entry.last_used = time.time()
+                return "running", ""
+            # Container may be up without the bridge knowing.
+            if self.container_state(entry.container) == "running":
+                port = self.container_port(entry.container)
+                served = self.probe(port) if port else ""
+                if served:
+                    entry.running, entry.port, entry.served_id = True, port, served
+                    entry.last_used = time.time()
+                    return "running", ""
+            failed = self.errors.get(entry.id)
+            if (failed and not force
+                    and time.time() - self.failed_at.get(entry.id, 0)
+                    < float(self.cfg.get("retry_backoff_seconds") or 0)):
+                return "error", failed[0] if isinstance(failed, tuple) else failed
+            if entry.id in self.starting and self.starting[entry.id].is_alive():
+                state = "loading"
+            else:
+                if self.cfg.get("evict_before_start", True):
+                    self.enforce_limits(exclude=entry.id)
+                self._start_locked(entry)
+                state = "loading"
+            event = self.ready[entry.id]
+
+        if event.wait(timeout=wait):
+            if entry.running:
+                return "running", ""
+            return "error", self.errors.get(entry.id, "model failed to load")
+        return "loading", (
+            f"'{entry.id}' is still loading in container {entry.container} "
+            f"(see: gufo logs {entry.container}); retry in a minute"
+        )
+
+    def _start_locked(self, entry: ModelEntry) -> None:
+        port = free_port(int(self.cfg["port_start"]))
+        ctx = entry.effective_ctx(self.cfg) or 131072
+        cmd = [
+            self.cfg["gufo_bin"], "run", str(entry.path),
+            "--no-register",                    # Lemonade, not pi, is the client here
+            "--name", entry.container,
+            "--port", str(port),
+            "--ctx", str(ctx),
+            "--ram-cache", str(int(self.cfg["ram_cache_bytes"])),
+            "--speculative", str(self.cfg.get("speculative", "auto")),
+        ]
+        # Older gufo CLIs (and older runtime images) do not know these flags;
+        # _forward still rewrites `model`, so falling back costs nothing but a
+        # less pretty id inside streamed replies.
+        name_args = ["--served-name", entry.id] if self.cfg.get("use_served_names", True) else []
+        key_args = (["--api-key", str(self.cfg["container_api_key"])]
+                    if self.cfg.get("container_api_key") else [])
+        base_cmd = list(cmd)
+        cmd += name_args + key_args
+        event = threading.Event()
+        self.ready[entry.id] = event
+        self.errors.pop(entry.id, None)
+        log(f"starting {entry.id}: {' '.join(cmd)}")
+
+        def worker() -> None:
+            try:
+                proc = run(cmd, timeout=None)
+                output = (proc.stderr or "") + (proc.stdout or "")
+                if proc.returncode != 0 and name_args and "unknown option" in output:
+                    log("warning: this 'gufo' CLI rejects --served-name; update it "
+                        "(lemonade-backend/install.sh) - starting without it")
+                    self.cfg["use_served_names"] = False
+                    proc = run(base_cmd + key_args, timeout=None)
+                if proc.returncode == 0:
+                    self.errors.pop(entry.id, None)
+                    served = self.probe(port)
+                    entry.running, entry.port, entry.served_id = True, port, served
+                    entry.last_used = time.time()
+                    self.enforce_limits(exclude=entry.id)
+                    log(f"ready: {entry.id} on http://127.0.0.1:{port}/v1 ({served})")
+                else:
+                    tail = ((proc.stderr or "") + (proc.stdout or "")).strip().splitlines()[-3:]
+                    self._fail(entry.id, "gufo run failed: " + " | ".join(tail))
+            except Exception as exc:  # noqa: BLE001
+                self._fail(entry.id, f"gufo run error: {exc}")
+            finally:
+                event.set()
+                with self.lock:
+                    self.starting.pop(entry.id, None)
+
+        thread = threading.Thread(target=worker, name=f"start-{entry.id}", daemon=True)
+        self.starting[entry.id] = thread
+        thread.start()
+
+    def _fail(self, model_id: str, message: str) -> None:
+        self.errors[model_id] = message
+        self.failed_at[model_id] = time.time()
+        log(f"failed to start {model_id}: {message}")
+
+    def stop(self, entry: ModelEntry) -> str:
+        with self.lock:
+            proc = run([self.cfg["gufo_bin"], "stop", entry.container], timeout=180)
+            entry.running = False
+            entry.port = 0
+            msg = (proc.stdout or proc.stderr or "").strip().splitlines()
+            if proc.returncode == 0:
+                # A stop clears the failure backoff, so the next request tries at once.
+                self.failed_at.pop(entry.id, None)
+                self.errors.pop(entry.id, None)
+                log(f"stopped {entry.container}")
+                return "stopped"
+            # Already gone is not an error.
+            if self.container_state(entry.container) in ("missing", "exited"):
+                return "stopped"
+            return " | ".join(msg[-2:]) or f"gufo stop failed ({proc.returncode})"
+
+    def loaded(self) -> list[ModelEntry]:
+        return [e for e in self.catalog.entries if e.running]
+
+    def enforce_limits(self, exclude: str = "") -> None:
+        max_loaded = int(self.cfg.get("max_loaded") or 0)
+        if max_loaded <= 0:
+            return
+        loaded = [e for e in self.loaded() if e.id != exclude]
+        loaded.sort(key=lambda e: e.last_used)
+        while len(loaded) + (1 if exclude else 0) > max_loaded and loaded:
+            victim = loaded.pop(0)
+            log(f"evicting {victim.id} (max_loaded={max_loaded})")
+            self.stop(victim)
+
+    def enforce_idle(self) -> None:
+        idle_min = int(self.cfg.get("idle_timeout_min") or 0)
+        if idle_min <= 0:
+            return
+        cutoff = time.time() - idle_min * 60
+        for entry in self.loaded():
+            if entry.last_used and entry.last_used < cutoff:
+                log(f"evicting {entry.id} (idle > {idle_min} min)")
+                self.stop(entry)
+
+    def watchdog(self) -> None:
+        while True:
+            time.sleep(30)
+            try:
+                for entry in self.catalog.entries:
+                    if entry.running and not self.probe(entry.port):
+                        state = self.container_state(entry.container)
+                        if state != "running":
+                            log(f"{entry.id}: container {entry.container} is {state}, marking stopped")
+                            entry.running = False
+                            entry.port = 0
+                self.enforce_idle()
+            except Exception as exc:  # noqa: BLE001
+                log(f"watchdog error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# HTTP bridge
+# ---------------------------------------------------------------------------
+
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-length",
+}
+
+
+class Registrar:
+    """Keeps the Lemonade provider record (and its in-memory key) alive.
+
+    Equivalent to running:
+        lemonade cloud install <provider> --base-url http://host:port/v1 \\
+            --api-key <key> --allow-insecure-http
+    which is also what makes Lemonade re-run discovery against the bridge.
+    """
+
+    def __init__(self, cfg: dict, catalog: Catalog):
+        self.cfg = cfg
+        self.catalog = catalog
+        self.lock = threading.Lock()
+        self.last_attempt = 0.0
+        self.last_ok = 0.0
+        self.last_scan = 0.0
+        self.detail = "never"
+
+    def needed(self) -> bool:
+        """True when lemond no longer publishes this provider's models."""
+        try:
+            models = http_json(f"{self.cfg['lemond_url']}/v1/models", timeout=6)
+        except Exception:  # noqa: BLE001 - lemond down: nothing to compare against
+            return False
+        prefix = self.cfg["provider"] + "."
+        ids = [m.get("id", "") for m in models.get("data", [])]
+        published = [i for i in ids if i.startswith(prefix)]
+        if not self.catalog.entries:
+            return False
+        # Re-register when the set of published ids differs from the catalog, so
+        # added/removed GGUF files show up without user action.
+        hidden = set(self.cfg.get("model_overrides", {}))
+        expected = {e.id for e in self.catalog.entries} - hidden
+        published_ids = {i[len(prefix):] for i in published}
+        return published_ids != (expected - hidden)
+
+    def register(self, force: bool = False) -> bool:
+        with self.lock:
+            if not self.cfg.get("auto_register", True) and not force:
+                return False
+            if not self.catalog.entries:
+                self.detail = "no models to publish"
+                return False
+            if not force and time.time() - self.last_attempt < 30:
+                return False
+            self.last_attempt = time.time()
+            cli = shutil.which("lemonade")
+            if not cli:
+                self.detail = "lemonade CLI not found in PATH"
+                return False
+            cmd = [
+                cli, "cloud", "install", str(self.cfg["provider"]),
+                "--base-url", bridge_url(self.cfg, "/v1"),
+                "--api-key", str(self.cfg.get("api_key") or "gufo-local"),
+                "--allow-insecure-http",
+            ]
+            try:
+                proc = run(cmd, timeout=120)
+            except Exception as exc:  # noqa: BLE001
+                self.detail = f"lemonade cloud install failed: {exc}"
+                return False
+            if proc.returncode != 0:
+                self.detail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1]
+                log(f"registration failed: {self.detail}")
+                return False
+            self.last_ok = time.time()
+            self.detail = "ok"
+            log(f"registered provider '{self.cfg['provider']}' with Lemonade")
+            return True
+
+    def maybe_scan(self) -> bool:
+        """Rescan on an interval; returns True when the catalog changed."""
+        interval = max(5, int(self.cfg.get("scan_interval_seconds") or 60))
+        if time.time() - self.last_scan < interval:
+            return False
+        self.last_scan = time.time()
+        before = {e.id: e.path for e in self.catalog.entries}
+        self.catalog.scan()
+        after = {e.id: e.path for e in self.catalog.entries}
+        if before != after:
+            added = sorted(set(after) - set(before))
+            removed = sorted(set(before) - set(after))
+            log(f"catalog changed: +{len(added)} -{len(removed)}"
+                + (f" (added: {', '.join(added[:3])})" if added else "")
+                + (f" (removed: {', '.join(removed[:3])})" if removed else ""))
+            return True
+        return False
+
+    def loop(self) -> None:
+        interval = max(1, int(self.cfg.get("register_interval_min") or 15)) * 60
+        while True:
+            time.sleep(15)
+            try:
+                changed = self.maybe_scan()
+                # Re-register when Lemonade's list drifted (lemond restarted, a
+                # model appeared/disappeared) or on the periodic interval.
+                if changed or time.time() - self.last_attempt >= interval or self.needed():
+                    self.register()
+            except Exception as exc:  # noqa: BLE001
+                log(f"registrar error: {exc}")
+
+
+class Bridge:
+    def __init__(self, cfg: dict, catalog: Catalog, engine: Engine, registrar: "Registrar"):
+        self.cfg = cfg
+        self.catalog = catalog
+        self.engine = engine
+        self.registrar = registrar
+        self.started_at = time.time()
+
+    # -- helpers --------------------------------------------------------------
+    def model_cards(self) -> list[dict]:
+        overrides = self.cfg.get("model_overrides", {})
+        return [
+            e.to_model_card(self.cfg)
+            for e in self.catalog.entries
+            if not overrides.get(e.id, {}).get("hidden", False)
+        ]
+
+    def status(self) -> dict:
+        return {
+            "bridge": VERSION,
+            "uptime_seconds": int(time.time() - self.started_at),
+            "endpoint": bridge_url(self.cfg, "/v1"),
+            "provider": self.cfg["provider"],
+            "lemond": self.cfg["lemond_url"],
+            "models_dirs": self.cfg["models_dirs"],
+            "catalog": [
+                {
+                    "id": e.id,
+                    "state": "running" if e.running else "stopped",
+                    "container": e.container,
+                    "port": e.port,
+                    "served_id": e.served_id,
+                    "path": str(e.path),
+                    "size_gb": round(e.size / 1e9, 2),
+                    "ctx": int(e.native_ctx or 0),
+                    "idle_minutes": int((time.time() - e.last_used) / 60) if e.last_used else None,
+                }
+                for e in self.catalog.entries
+            ],
+            "loaded": [e.id for e in self.engine.loaded()],
+            "registration": {
+                "provider": self.cfg["provider"],
+                "base_url": bridge_url(self.cfg, "/v1"),
+                "last_ok_seconds_ago": int(time.time() - self.registrar.last_ok)
+                if self.registrar.last_ok else None,
+                "detail": self.registrar.detail,
+            },
+        }
+
+    def resolve_entry(self, name: str):
+        if name:
+            entry = self.catalog.get(name)
+            if entry:
+                return entry
+        if name in ("", "*", None):
+            running = self.engine.loaded()
+            if running:
+                return running[0]
+            for candidate in self.cfg.get("autostart", []):
+                entry = self.catalog.get(candidate)
+                if entry:
+                    return entry
+        return None
+
+def make_handler(cfg: dict, catalog: Catalog, engine: Engine, bridge: Bridge, registrar: Registrar):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = f"gufo-lemonade/{VERSION}"
+
+        # -- plumbing ---------------------------------------------------------
+        def log_message(self, fmt: str, *args) -> None:  # quieter, journald-friendly
+            log(f"{self.address_string()} {fmt % args}")
+
+        def _authorized(self, path: str) -> bool:
+            """Lemonade replays the provider key as `Authorization: Bearer <key>`.
+
+            /health stays open so install.sh and health probes can reach a
+            locked bridge; everything else needs the configured key.
+            """
+            if path in ("/health", "/healthz"):
+                return True
+            return bearer_ok(self.headers.get("Authorization"),
+                             str(bridge.cfg.get("api_key") or ""))
+
+        def _body(self) -> bytes:
+            length = int(self.headers.get("Content-Length") or 0)
+            return self.rfile.read(length) if length else b""
+
+        # -- responses --------------------------------------------------------
+        def _respond(self, status: int, payload: bytes, ctype: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _json(self, status: int, obj) -> None:
+            self._respond(status, json.dumps(obj).encode(), "application/json")
+
+        def _error(self, status: int, message: str, hint: str = "") -> None:
+            body = {"error": {"message": message, "type": "gufo_bridge_error", "code": status}}
+            if hint:
+                body["error"]["hint"] = hint
+            self._json(status, body)
+
+        # -- proxy ------------------------------------------------------------
+        def _forward(self, entry, path: str, body: bytes, stream: bool) -> None:
+            # Gufo serves each container under the name baked into the GGUF
+            # (general.name), which is not the id we publish; hand the container
+            # the name it expects.
+            target = entry.served_id or entry.id
+            if target != entry.id:
+                try:
+                    req = json.loads(body.decode("utf-8"))
+                    req["model"] = target
+                    body = json.dumps(req).encode()
+                except Exception:  # noqa: BLE001 - leave the body untouched
+                    pass
+            url = f"http://127.0.0.1:{entry.port}{path}"
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream" if stream else "application/json",
+            }
+            if bridge.cfg.get("container_api_key"):
+                headers["Authorization"] = f"Bearer {bridge.cfg['container_api_key']}"
+            req = urllib.request.Request(url, data=body if body else None,
+                                         headers=headers, method="POST")
+            # Generous: generation on a big context, or a model that is still
+            # settling into page cache, can take a long time.
+            try:
+                resp = urllib.request.urlopen(req, timeout=4 * 3600)  # noqa: S310
+            except urllib.error.HTTPError as exc:
+                payload = exc.read()
+                self._respond(exc.code, payload,
+                              exc.headers.get("Content-Type", "application/json"))
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._error(
+                    502,
+                    f"the gufo container for '{entry.id}' is not reachable on "
+                    f"port {entry.port}: {exc}",
+                    hint=f"gufo logs {entry.container}",
+                )
+                return
+
+            status = getattr(resp, "status", 200)
+            ctype = resp.headers.get("Content-Type", "application/json")
+            if stream or "event-stream" in ctype:
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                try:
+                    while True:
+                        chunk = resp.read1(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    log("client disconnected mid-stream")
+                finally:
+                    resp.close()
+                return
+
+            raw = resp.read()
+            resp.close()
+            # Normalise the reported model id back to the Lemonade-facing one.
+            try:
+                data = json.loads(raw.decode("utf-8"))
+                if isinstance(data, dict) and data.get("model") not in (None, entry.id):
+                    data["model"] = entry.id
+                raw = json.dumps(data).encode()
+            except Exception:  # noqa: BLE001
+                pass
+            self._respond(status, raw, "application/json")
+
+        # -- routes -----------------------------------------------------------
+        def do_GET(self) -> None:  # noqa: N802
+            path = self.path.split("?", 1)[0]
+            if not self._authorized(path):
+                self._error(401, "missing or invalid API key",
+                            "send 'Authorization: Bearer <api_key>' (config key: api_key)")
+                return
+            if path in ("/v1/models", "/models", "/api/models"):
+                self._json(200, {"object": "list", "data": bridge.model_cards()})
+                return
+            if path in ("/health", "/healthz"):
+                self._json(200, {
+                    "status": "ok",
+                    "bridge": VERSION,
+                    "uptime_seconds": int(time.time() - bridge.started_at),
+                    "catalog": len(catalog.entries),
+                    "loaded": [e.id for e in engine.loaded()],
+                })
+                return
+            if path == "/gufo/status":
+                self._json(200, bridge.status())
+                return
+            if path.startswith("/v1/models/"):
+                name = path.rsplit("/", 1)[-1]
+                entry = catalog.get(name)
+                if entry:
+                    self._json(200, entry.to_model_card(cfg))
+                else:
+                    self._error(404, f"unknown model '{name}'", "gufo-lemonade models")
+                return
+            if path.startswith("/v1/"):
+                # GET on other /v1 paths is not something lemond asks for.
+                self._error(404, f"unsupported path {path}")
+                return
+            self._json(200, {
+                "name": "gufo-lemonade bridge",
+                "version": VERSION,
+                "openai": "/v1",
+                "admin": "/gufo/status",
+            })
+
+        def do_POST(self) -> None:  # noqa: N802
+            path = self.path.split("?", 1)[0]
+            if not self._authorized(path):
+                self._error(401, "missing or invalid API key",
+                            "send 'Authorization: Bearer <api_key>' (config key: api_key)")
+                return
+            body = self._body()
+
+            if path == "/gufo/load":
+                try:
+                    req = json.loads(body or b"{}")
+                except ValueError:
+                    self._error(400, "expected a JSON body")
+                    return
+                entry = bridge.resolve_entry(str(req.get("model") or ""))
+                if not entry:
+                    self._error(404, f"unknown model '{req.get('model')}'",
+                                  "gufo-lemonade models")
+                    return
+                wait = float(req.get("wait") or 900)
+                state, message = engine.ensure(entry, wait, force=bool(req.get("force")))
+                self._json(200 if state == "running" else 503, {
+                    "model": entry.id, "state": state, "message": message or state,
+                    "port": entry.port,
+                })
+                return
+
+            if path == "/gufo/unload":
+                try:
+                    req = json.loads(body or b"{}")
+                except ValueError:
+                    self._error(400, "expected a JSON body")
+                    return
+                target = str(req.get("model") or "all")
+                if target == "all":
+                    results = {e.id: engine.stop(e) for e in engine.loaded()}
+                    self._json(200, {"stopped": results})
+                    return
+                entry = bridge.resolve_entry(target)
+                if not entry:
+                    self._error(404, f"unknown model '{target}'", "gufo-lemonade models")
+                    return
+                self._json(200, {"model": entry.id, "state": engine.stop(entry)})
+                return
+
+            if path == "/gufo/scan":
+                catalog.scan()
+                registered = registrar.register(force=True)
+                self._json(200, {"models": len(catalog.entries), "registered": registered,
+                                 "detail": registrar.detail})
+                return
+
+            if not path.startswith("/v1/"):
+                self._error(404, f"unsupported path {path}")
+                return
+
+            try:
+                req = json.loads(body or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError
+            except ValueError:
+                self._error(400, "request body must be a JSON object")
+                return
+
+            entry = bridge.resolve_entry(str(req.get("model") or ""))
+            if not entry:
+                known = ", ".join(e.id for e in catalog.entries[:12])
+                self._error(
+                    404,
+                    f"unknown model '{req.get('model')}' for the gufo bridge",
+                    f"available: {known}",
+                )
+                return
+
+            state, message = engine.ensure(entry, float(cfg["start_wait_seconds"]))
+            if state != "running":
+                self._error(
+                    503 if state == "loading" else 502,
+                    message or f"'{entry.id}' is not ready",
+                    f"gufo-lemonade load '{entry.id}' warms it up; gufo logs {entry.container} shows progress",
+                )
+                return
+
+            entry.last_used = time.time()
+            self._forward(entry, path, body, bool(req.get("stream")))
+
+    return Handler
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def bridge_url(cfg: dict, path: str) -> str:
+    host = cfg["host"] if cfg["host"] != "0.0.0.0" else "127.0.0.1"
+    return f"http://{host}:{cfg['port']}{path}"
+
+
+def cmd_serve(cfg: dict) -> int:
+    catalog = Catalog(cfg)
+    engine = Engine(cfg, catalog)
+    registrar = Registrar(cfg, catalog)
+    bridge = Bridge(cfg, catalog, engine, registrar)
+
+    if not Path(cfg["gufo_bin"]).exists() and not shutil.which(cfg["gufo_bin"]):
+        log(f"error: gufo CLI not found ({cfg['gufo_bin']}); install it or set gufo_bin")
+        return 1
+    if not shutil.which("podman"):
+        log("error: podman not found in PATH")
+        return 1
+
+    log(f"{PROG} {VERSION}: {len(catalog.entries)} model(s) in "
+        f"{', '.join(cfg['models_dirs'])}; listening on http://{cfg['host']}:{cfg['port']}/v1")
+    engine.adopt_running()
+    engine.enforce_limits()
+    for name in cfg.get("autostart", []):
+        entry = catalog.get(name)
+        if not entry:
+            log(f"autostart: unknown model '{name}'")
+            continue
+        log(f"autostart: {entry.id}")
+        engine.ensure(entry, 0)  # kick it off, do not block the listener
+
+    threading.Thread(target=engine.watchdog, name="watchdog", daemon=True).start()
+    if cfg.get("auto_register", True):
+        # Best effort: lemond may not be up yet, the registrar loop retries.
+        threading.Thread(target=registrar.register, kwargs={"force": True},
+                         name="register", daemon=True).start()
+        threading.Thread(target=registrar.loop, name="registrar", daemon=True).start()
+
+    server = ThreadingHTTPServer((cfg["host"], int(cfg["port"])),
+                                 make_handler(cfg, catalog, engine, bridge, registrar))
+    server.daemon_threads = True
+
+    def shutdown(*_args):
+        log("shutting down (gufo containers are left running; stop them with `gufo stop all`)")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
+    return 0
+
+
+def cmd_models(cfg: dict) -> int:
+    catalog = Catalog(cfg)
+    if not catalog.entries:
+        print(f"no .gguf models found in: {', '.join(cfg['models_dirs'])}")
+        return 1
+    loaded: list[str] = []
+    try:
+        loaded = http_json(bridge_url(cfg, "/gufo/status"), timeout=4,
+                           bearer=str(cfg.get("api_key") or "")).get("loaded", [])
+    except Exception:  # noqa: BLE001 - the bridge may simply not be running
+        # Fall back to asking podman directly.
+        try:
+            proc = subprocess.run(
+                ["podman", "ps", "--filter", "name=gufo-", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            running = {n.strip() for n in (proc.stdout or "").splitlines() if n.strip()}
+            loaded = [e.id for e in catalog.entries if e.container in running]
+        except Exception:  # noqa: BLE001
+            loaded = []
+    print(f"{'Lemonade id':<44} {'size':>8}  {'state':<8} path")
+    for entry in catalog.entries:
+        state = "running" if entry.id in loaded else "stopped"
+        print(f"{cfg['provider'] + '.' + entry.id:<44} {entry.size / 1e9:6.2f}GB  "
+              f"{state:<8} {entry.path}")
+    try:
+        health = http_json(bridge_url(cfg, "/health"), timeout=3)
+        print(f"\nbridge    : {bridge_url(cfg, '/v1')} is serving "
+              f"{health.get('catalog')} model(s), loaded: "
+              f"{', '.join(health.get('loaded') or []) or 'none'}")
+        print(f"use one   : lemonade run '{cfg['provider']}.{catalog.entries[0].id}'")
+    except Exception:  # noqa: BLE001
+        print("\nbridge not running: `systemctl --user start gufo-lemonade` "
+              "(or `gufo-lemonade serve`), then `gufo-lemonade refresh` to publish.")
+    return 0
+
+
+def cmd_status(cfg: dict) -> int:
+    print(f"bridge    : {bridge_url(cfg, '')}")
+    try:
+        health = http_json(bridge_url(cfg, "/gufo/status"), timeout=4,
+                           bearer=str(cfg.get("api_key") or ""))
+    except Exception as exc:  # noqa: BLE001
+        print(f"          : not running ({exc})")
+        health = None
+    if health:
+        catalog = health.get("catalog") or []
+        loaded = set(health.get("loaded") or [])
+        print(f"          : up {health.get('uptime_seconds', 0)}s, "
+              f"{len(catalog)} model(s) cataloged")
+        for entry in catalog:
+            state = "loaded" if entry["id"] in loaded else entry.get("state", "stopped")
+            idle = entry.get("idle_minutes")
+            if state == "loaded" and idle is not None:
+                state += f", idle {idle}m"
+            print(f"            - {cfg['provider']}.{entry['id']}"
+                  f"  [{state}]  {entry.get('size_gb', '?')} GB"
+                  f"  ctx {entry.get('ctx') or '-'}"
+                  + (f"  :{entry['port']}" if entry.get("port") else ""))
+        reg = health.get("registration") or {}
+        if reg:
+            age = reg.get("last_ok_seconds_ago")
+            print(f"          : provider '{reg.get('provider')}' -> {reg.get('base_url')}"
+                  f"  ({reg.get('detail')}"
+                  + (f", {age}s ago" if isinstance(age, int) else "") + ")")
+    print(f"lemond    : {cfg['lemond_url']}")
+    try:
+        models = http_json(f"{cfg['lemond_url']}/v1/models", timeout=8)
+        prefix = cfg["provider"] + "."
+        gufo_models = [m["id"] for m in models.get("data", [])
+                       if str(m.get("id", "")).startswith(prefix)]
+        print(f"          : {len(gufo_models)} model(s) published as '{prefix}*'")
+        for model in gufo_models:
+            print(f"            - {model}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"          : unreachable ({exc})")
+    return 0
+
+
+def cmd_load(cfg: dict) -> int:  # (name passed via argv)
+    args = sys.argv[2:]
+    force = "--force" in args
+    wait = 900
+    if "--wait" in args:
+        i = args.index("--wait")
+        try:
+            wait = int(args[i + 1])
+        except (IndexError, ValueError):
+            print("usage: gufo-lemonade load MODEL [--force] [--wait SECONDS]")
+            return 2
+        args = args[:i] + args[i + 2:]
+    name = " ".join(a for a in args if not a.startswith("--"))
+    try:
+        data = http_json(bridge_url(cfg, "/gufo/load"),
+                         {"model": name, "wait": wait, "force": force},
+                         timeout=wait + 30, bearer=str(cfg.get("api_key") or ""))
+    except urllib.error.HTTPError as exc:
+        print(exc.read().decode("utf-8", "replace"))
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"bridge not reachable: {exc}")
+        return 1
+    print(json.dumps(data, indent=2))
+    return 0 if data.get("state") == "running" else 1
+
+
+def cmd_unload(cfg: dict) -> int:
+    name = sys.argv[2] if len(sys.argv) > 2 else "all"
+    try:
+        data = http_json(bridge_url(cfg, "/gufo/unload"), {"model": name}, timeout=300,
+                         bearer=str(cfg.get("api_key") or ""))
+    except urllib.error.HTTPError as exc:
+        print(exc.read().decode("utf-8", "replace"))
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"bridge not reachable: {exc}")
+        return 1
+    print(json.dumps(data, indent=2))
+    return 0
+
+
+def cmd_scan(cfg: dict) -> int:
+    """Rescan the model directories, then re-publish the catalog in Lemonade."""
+    try:
+        data = http_json(bridge_url(cfg, "/gufo/scan"), {}, timeout=15,
+                         bearer=str(cfg.get("api_key") or ""))
+        print(f"bridge cataloged {data.get('models')} model(s)")
+    except Exception as exc:  # noqa: BLE001
+        count = len(Catalog(cfg).entries)
+        print(f"bridge not reachable ({exc}); local scan found {count} model(s)")
+    return cmd_refresh(cfg)
+
+
+def cmd_refresh(cfg: dict) -> int:
+    """Re-run Lemonade's discovery for this provider (after adding/removing GGUFs)."""
+    cmd = ["lemonade", "cloud", "install", cfg["provider"],
+           "--base-url", bridge_url(cfg, "/v1"),
+           "--api-key", os.environ.get("GUFO_LEMONADE_API_KEY", "gufo-local"),
+           "--allow-insecure-http"]
+    proc = run(cmd)
+    if proc.returncode != 0:
+        print("`lemonade cloud install` failed; is lemond running? "
+              f"({cfg['lemond_url']}) and is this CLI version >= 11?")
+        return proc.returncode
+    try:
+        models = http_json(f"{cfg['lemond_url']}/v1/models", timeout=10)
+        prefix = cfg["provider"] + "."
+        ids = [m["id"] for m in models.get("data", []) if m["id"].startswith(prefix)]
+        print(f"Lemonade now lists {len(ids)} gufo model(s):")
+        for model in ids:
+            print(f"  - {model}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"provider installed, but could not read {cfg['lemond_url']}/v1/models: {exc}")
+    return 0
+
+
+def cmd_doctor(cfg: dict) -> int:
+    checks = []
+
+    def check(name, ok, detail=""):
+        checks.append((name, ok, detail))
+
+    check("python", sys.version_info >= (3, 8), sys.version.split()[0])
+    check("gufo CLI", bool(shutil.which(cfg["gufo_bin"]) or Path(cfg["gufo_bin"]).exists()),
+          str(cfg["gufo_bin"]))
+    check("podman", bool(shutil.which("podman")), shutil.which("podman") or "missing")
+    check("jq", bool(shutil.which("jq")), "used by the gufo CLI")
+    gpu = Path("/dev/kfd").exists()
+    check("AMD GPU (/dev/kfd)", gpu, "" if gpu else "no ROCm device: containers run on CPU")
+    check("models dir", any(Path(d).is_dir() for d in cfg["models_dirs"]),
+          ", ".join(cfg["models_dirs"]))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    host = cfg["host"] if cfg["host"] != "0.0.0.0" else "127.0.0.1"
+    reachable = sock.connect_ex((host, int(cfg["port"]))) == 0
+    sock.close()
+    check("bridge listening", reachable, f"http://{host}:{cfg['port']}")
+    try:
+        models = http_json(f"{cfg['lemond_url']}/v1/models", timeout=6)
+        check("lemond", True, f"{len(models.get('data', []))} models at {cfg['lemond_url']}")
+    except Exception as exc:  # noqa: BLE001
+        check("lemond", False, f"{cfg['lemond_url']}: {exc}")
+    if shutil.which("lemonade"):
+        proc = run(["lemonade", "cloud", "list"], timeout=20)
+        listed = (proc.stdout or "")
+        check(f"provider '{cfg['provider']}' installed",
+              cfg["provider"] in listed, listed.strip().splitlines()[0] if listed.strip() else "")
+    else:
+        check("lemonade CLI", False, "not in PATH")
+
+    bad = 0
+    for name, ok, detail in checks:
+        print(f"  [{'ok ' if ok else 'FAIL'}] {name:<32} {detail}")
+        bad += 0 if ok else 1
+    print("\nall good" if not bad else f"{bad} check(s) failed")
+    return 0 if not bad else 1
+
+
+def cmd_config(cfg: dict) -> int:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if CONFIG_PATH.exists() and "--force" not in sys.argv:
+        print(f"{CONFIG_PATH} already exists (use --force to overwrite)")
+        return 1
+    CONFIG_PATH.write_text(json.dumps(DEFAULTS, indent=2) + "\n")
+    print(f"wrote {CONFIG_PATH}")
+    return 0
+
+
+def main() -> int:
+    cfg = load_config()
+    argv = sys.argv[1:]
+    command = argv[0] if argv else "serve"
+    if command in ("-h", "--help", "help"):
+        print(__doc__)
+        print("""commands:
+  serve                    run the bridge (what systemd runs)
+  models                   list the GGUF catalog and its load state
+  status                   bridge + Lemonade view
+  scan                     rescan the models directories now
+  load MODEL [--force] [--wait N]   start a model container now (warm it up)
+  unload MODEL|all         stop a model container
+  refresh                  re-register the provider so Lemonade re-discovers models
+  doctor                   check prerequisites
+  config [--force]         write the default config file
+
+config: {path}
+""".format(path=CONFIG_PATH))
+        return 0
+    handlers = {
+        "serve": cmd_serve,
+        "models": cmd_models,
+        "status": cmd_status,
+        "load": cmd_load,
+        "unload": cmd_unload,
+        "scan": cmd_scan,
+        "refresh": cmd_refresh,
+        "doctor": cmd_doctor,
+        "config": cmd_config,
+    }
+    handler = handlers.get(command)
+    if not handler:
+        print(f"unknown command: {command} (try: {', '.join(handlers)})", file=sys.stderr)
+        return 2
+    return handler(cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

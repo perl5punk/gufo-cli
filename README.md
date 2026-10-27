@@ -113,9 +113,31 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `--speculative MODE [GGUF]` | `auto` | Draft backend: `auto`, `off`, `mtp`, `dflash2`, `dspark`; optional explicit sidecar path |
 | `--draft-tokens N` | 7 (1–7) | Draft cap per step |
 | `--draft-policy POLICY` | engine default | DFlash2 block policy: `fixed` or `adaptive` |
+| `--served-name ID` | GGUF `general.name` | Model id exposed by the OpenAI API (use a stable id when another app lists models and forwards requests back to you) |
+| `--api-key KEY` | none | Require this bearer key in the container |
 | `--image IMG` | `ghcr.io/gufo-org/toolboxes/gufo-runtime:latest` | Runtime image |
 | `--no-register` | — | Container only, skip `models.json` |
 | `--tailscale` | off | Expose the endpoint on your tailnet via `tailscale serve` (see below) |
+
+## Lemonade Server integration
+
+[`lemonade-backend/`](lemonade-backend/README.md) adds **`gufo-lemonade`**, a
+local bridge that publishes every GGUF in your model directories to
+[Lemonade Server](https://lemonade-server.ai) as the `gufo` provider: the models
+appear in the Lemonade UI and `/v1/models`, and the bridge starts the right
+container on demand (and frees memory for it) before proxying the request,
+streaming included.
+
+```bash
+cd lemonade-backend && ./install.sh     # no root, no Lemonade rebuild
+gufo-lemonade status
+```
+
+It runs as your user with rootless podman and never edits `models.json`, so this
+CLI keeps working unchanged. [Why it is built this way](lemonade-backend/docs/ANALYSIS.md)
+— Lemonade compiles backends into `lemond`, so a first-class `gufo` recipe would
+mean a fork; the doc includes the blueprint. See also
+[troubleshooting](lemonade-backend/docs/TROUBLESHOOTING.md).
 
 ## Speculative decoding
 

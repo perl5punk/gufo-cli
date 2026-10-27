@@ -1,0 +1,22 @@
+[Unit]
+Description=Gufo bridge for Lemonade Server
+Documentation=https://lemonade-server.ai/docs/dev/adding-a-backend/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@BRIDGE@ serve
+Environment=GUFO_LEMONADE_PORT=@PORT@
+# The bridge shells out to `gufo`, `podman` and `jq`, and `gufo` must find the
+# user's podman socket, so give it a normal user PATH plus ~/.local/bin.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+SyslogIdentifier=gufo-lemonade
+Restart=on-failure
+RestartSec=5
+# Stopping the bridge must not kill models: containers are owned by `gufo stop`.
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
