@@ -180,11 +180,12 @@ ts_dns_name() {
   tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//'
 }
 
-# true if a serve handler currently proxies http(s)://127.0.0.1:<port>
+# true if a serve handler currently proxies to local port <port>
+# (matches http(s) targets on 127.0.0.1, localhost, or 0.0.0.0 — manual configs vary)
 serve_has_port() {
   tailscale serve status --json 2>/dev/null \
     | jq -e --arg p "$1" \
-      '[.Web[]?.Handlers[]?.Proxy?] | any(test("127\\.0\\.0\\.1:" + $p + "$"))' \
+      '[.Web[]?.Handlers[]?.Proxy?] | any(test("(127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0):" + $p + "$"))' \
     >/dev/null 2>&1
 }
 
