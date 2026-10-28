@@ -57,15 +57,20 @@ resolve_model() {
       lb="${f##*/}"
       lb_n="${lb,,}"
       lb_n="${lb_n//_/-}"
+      # draft sidecars and vision projectors are never serve targets (an MTP
+      # "shared" sidecar e.g. has no token-embedding table at all)
+      case "$lb_n" in mtp-*|*dflash*|*dspark*|mmproj*) continue ;; esac
       if [ "$lb_n" = "${base//_/-}" ] || [[ "$lb_n" == *"${ql//_/-}"* ]]; then
         printf '%s\n' "$f"
         return 0
       fi
-    done < <(find "$d" -maxdepth 4 -iname '*.gguf' 2>/dev/null)
+    done < <(find "$d" -maxdepth 4 -iname '*.gguf' 2>/dev/null | sort) # deterministic shard order
   done
   for d in "${GUFO_MODELS_DIRS[@]}"; do
     [ -d "$d" ] || continue
-    hit=$(find "$d" -maxdepth 4 -iname '*.gguf' -ipath "*$query*" 2>/dev/null | head -1)
+    hit=$(find "$d" -maxdepth 4 -iname '*.gguf' \
+            ! \( -iname 'mtp-*' -o -iname '*dflash*' -o -iname '*dspark*' -o -iname 'mmproj*' \) \
+            -ipath "*$query*" 2>/dev/null | sort | head -1)
     if [ -n "$hit" ]; then
       printf '%s\n' "$hit"
       return 0
