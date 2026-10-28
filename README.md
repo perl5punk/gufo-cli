@@ -97,6 +97,7 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `status` | All `gufo-*` containers: state, port, served model id, registration |
 | `logs [name] [--no-follow]` | Tail container logs (follows by default) |
 | `prompt <model> "text" [--max-tokens N]` | One-shot generation (no container kept) |
+| `gpu` | Check GPU device nodes and container access (udev trap on Ubuntu-family hosts) |
 | `refresh [name]` | Re-read the served model id and resync `models.json` (after swapping GGUF files in place) |
 | `unregister <model\|name>` | Remove the provider from `models.json` only |
 | `diagnose` | Run `gufo diagnose` in the runtime image (GPU/toolchain check) |
@@ -119,6 +120,33 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `--image IMG` | `ghcr.io/gufo-org/toolboxes/gufo-runtime:latest` | Runtime image |
 | `--no-register` | — | Container only, skip `models.json` |
 | `--tailscale` | off | Expose the endpoint on your tailnet via `tailscale serve` (see below) |
+
+## GPU device access (`gpu`)
+
+```sh
+gufo gpu
+```
+
+Checks that the runtime container can actually open `/dev/kfd` and
+`/dev/dri/renderD*` — it stats the host nodes and probes read/write access from
+*inside* a throwaway container. Rootless podman cannot carry the `render` group
+across its user-namespace boundary, so distros that ship these nodes
+`0660 root:render` (Ubuntu/Pop!_OS defaults; Fedora ships `0666`) fail every
+GPU load with misleading errors despite a healthy host — observed in the wild:
+`no ROCm-capable device is detected` and `weight upload staging allocation
+failed`. The fix, printed by `gufo gpu` on failure, is a udev rule making the
+nodes world-accessible:
+
+```sh
+sudo tee /etc/udev/rules.d/99-gpu-access.rules >/dev/null <<'RULES'
+KERNEL=="renderD[0-9]*", GROUP="render", MODE="0666"
+KERNEL=="kfd", GROUP="render", MODE="0666"
+RULES
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+`gufo run` performs this check before every start (quiet on success);
+`--skip-device-check` or `GUFO_SKIP_DEVICE_CHECK=1` bypasses it.
 
 ## Lemonade Server integration
 

@@ -296,8 +296,67 @@ cmd_models() {
   fi
 }
 
+# The runtime container must open /dev/kfd and /dev/dri/renderD* directly. Rootless
+# podman cannot carry the 'render' group across the user-namespace boundary, so on
+# distros that ship these nodes 0660 root:render (Ubuntu/Pop!_OS defaults; Fedora
+# ships 0666) every containerized load fails with "no ROCm-capable device" — or the
+# misleading "weight upload staging allocation failed" — despite a healthy host.
+device_access_probe() { # -q: silent unless failing
+  local quiet="${1:-}" out rc n
+  local miss=0
+  for n in /dev/kfd /dev/dri/renderD*; do
+    [ -e "$n" ] || { echo "ERROR: missing device node: $n" >&2; miss=1; }
+  done
+  if [ "$miss" = 1 ]; then
+    echo "amdgpu/KFD not loaded? check: lsmod | grep amdgpu ; sudo dmesg | grep -iE 'amdgpu|kfd' | tail" >&2
+    return 1
+  fi
+  if ! podman image inspect "$GUFO_IMAGE" >/dev/null 2>&1; then
+    [ "$quiet" = "-q" ] || echo "note: runtime image not pulled yet; container probe skipped"
+    return 0
+  fi
+  out=$(podman run --rm --device /dev/kfd --device /dev/dri "$GUFO_IMAGE" sh -c '
+        rc=0
+        for n in /dev/kfd /dev/dri/renderD*; do
+          [ -e "$n" ] || continue
+          if [ -r "$n" ] && [ -w "$n" ]; then echo "ok   $n"
+          else echo "DENY $n"; rc=1; fi
+        done
+        exit $rc' 2>&1)
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "ERROR: the runtime container cannot read/write the GPU device nodes:" >&2
+    printf '%s\n' "$out" | sed 's/^/  /' >&2
+    echo >&2
+    echo "Rootless podman cannot inherit 'render' group membership across the" >&2
+    echo "user-namespace boundary. Make the nodes world-accessible (persistent):" >&2
+    cat >&2 <<'FIX'
+  sudo tee /etc/udev/rules.d/99-gpu-access.rules >/dev/null <<'RULES'
+  KERNEL=="renderD[0-9]*", GROUP="render", MODE="0666"
+  KERNEL=="kfd", GROUP="render", MODE="0666"
+  RULES
+  sudo udevadm control --reload && sudo udevadm trigger
+FIX
+    echo "(throwaway test, resets on reboot: sudo chmod 666 /dev/kfd /dev/dri/renderD*)" >&2
+    return 1
+  fi
+  [ "$quiet" = "-q" ] || { printf '%s\n' "$out"; echo "gpu: container device access OK"; }
+}
+
+cmd_gpu() {
+  echo "rootless podman: $(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)"
+  echo "host device nodes:"
+  local n ok=1
+  for n in /dev/kfd /dev/dri/renderD*; do
+    [ -e "$n" ] || { echo "  missing: $n"; ok=0; continue; }
+    printf '  %s\n' "$(stat -c '%n  %A  %U:%G' "$n")"
+  done
+  [ "$ok" = 1 ] || echo "  (missing nodes: driver not loaded — see dmesg)" >&2
+  device_access_probe
+}
+
 cmd_run() {
-  local model_q="" port="" name="" image="$GUFO_IMAGE" register=1
+  local model_q="" port="" name="" image="$GUFO_IMAGE" register=1 skip_devcheck="${GUFO_SKIP_DEVICE_CHECK:-0}"
   local ctx=$GUFO_CTX_DEFAULT max=$GUFO_MAX_DEFAULT ram_cache=$GUFO_RAM_CACHE_DEFAULT
   local spec_mode=auto spec_path="" draft_tokens="" draft_policy=""
   local served_name="" api_key=""
@@ -317,6 +376,7 @@ cmd_run() {
       --served-name|--served-model-name) served_name="${2:-}"; shift 2 ;;
       --api-key)     api_key="${2:-}"; shift 2 ;;
       --no-register) register=0; shift ;;
+      --skip-device-check) skip_devcheck=1; shift ;;
       --tailscale)   tailscale=1; shift ;;
       -h|--help)     usage; exit 0 ;;
       -*)            die "unknown option: $1" ;;
@@ -337,6 +397,10 @@ cmd_run() {
   if [ "$tailscale" = 1 ]; then
     command -v tailscale >/dev/null || die "tailscale not found in PATH"
     tailscale ip -4 >/dev/null 2>&1 || die "tailscale is not up (tailscale status)"
+  fi
+
+  if [ "$skip_devcheck" != 1 ]; then
+    device_access_probe -q || die "fix GPU device access above (gufo gpu), or re-run with --skip-device-check"
   fi
 
   local path
@@ -773,6 +837,8 @@ gufo — manage GGUF models via Gufo containers, hooked into pi-webui
 usage: gufo <command> [args]
 
   models                          list available .gguf files
+  gpu                             check GPU device nodes + container access (run after
+                                  driver installs, OS upgrades, or on any load error)
   run <model> [opts]              start model + register in pi models.json
       --port N                    host port (default: first free from $GUFO_PORT_START)
       --name slug                 container name (default: gufo-<model-slug>)
@@ -789,6 +855,7 @@ usage: gufo <command> [args]
                                   lists models and forwards requests back to us
       --api-key KEY               require this bearer key in the container
       --no-register               container only, skip models.json
+      --skip-device-check         don't verify container GPU device access before start
       --tailscale                 expose endpoint on the tailnet via 'tailscale serve'
                                   (https://<node>.<tailnet>.ts.net:<port>/v1; auto-cleaned on stop;
                                   needs operator rights once: sudo tailscale set --operator=$USER)
@@ -818,6 +885,7 @@ if [ $# -gt 0 ]; then
 fi
 case "$cmd" in
   models)      cmd_models "$@" ;;
+  gpu)         cmd_gpu "$@" ;;
   run|start)   cmd_run "$@" ;;
   stop)        cmd_stop "$@" ;;
   status)      cmd_status "$@" ;;
