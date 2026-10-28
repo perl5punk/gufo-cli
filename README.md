@@ -100,6 +100,7 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `refresh [name]` | Re-read the served model id and resync `models.json` (after swapping GGUF files in place) |
 | `unregister <model\|name>` | Remove the provider from `models.json` only |
 | `diagnose` | Run `gufo diagnose` in the runtime image (GPU/toolchain check) |
+| `download <recipe>` | Fetch a verified model + speculative sidecar from Hugging Face (`flash-next`, `dflash2-27b`) |
 
 ### `run` options
 
@@ -184,6 +185,31 @@ Measured on a Strix Halo (Strix Point X1), Qwen3.8-27B:
 
 The container's load log confirms the backend:
 `podman logs <name> | grep -o 'speculative=[a-z0-9]*'`.
+
+## Downloading a model (`download`)
+
+Rather than hand-writing `hf download` invocations, `gufo download <recipe>`
+fetches a known-good model plus its speculative sidecar, verifies every file
+byte-for-byte, and lands them where `run --speculative auto` will find them:
+
+```sh
+gufo download flash-next    # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP sidecar (~114 GB)
+gufo download dflash2-27b   # DFlash2 draft next to the 27B GGUF (~1.1 GB)
+```
+
+Each recipe pins a specific repo revision, checks there is enough free disk
+before starting, and is resumable — rerun it if a transfer drops. It needs the
+[`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)
+(installed and `hf auth login`).
+
+- **`flash-next`** writes shards to `<models-dir>/qwen3.8-flash-next/UD-Q4_K_XL/`
+  and the MTP sidecar to `…/MTP/mtp-*.gguf`; `gufo run flash-next --ctx 32768`
+  then auto-enables MTP.
+- **`dflash2-27b`** drops `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` beside the 27B target
+  in `Qwen3.8-27B-GGUF/`; `gufo run <27b>` then auto-enables DFlash2.
+
+Both land in the first entry of `GUFO_MODELS_DIRS` (`~/models` by default), so
+they show up in `gufo models` immediately.
 
 ## Exposing an endpoint on your tailnet
 

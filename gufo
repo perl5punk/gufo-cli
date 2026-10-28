@@ -674,6 +674,93 @@ cmd_diagnose() {
   podman run --rm "${GPU_FLAGS[@]}" "$GUFO_IMAGE" gufo diagnose
 }
 
+# Verified model recipes for gufo's speculative decoding. Files are fetched into
+# the first models dir so `run --speculative auto` discovers the sidecars:
+#   MTP sidecar   -> <model-dir>/MTP/mtp-*.gguf  (Flash-Next)
+#   DFlash2 draft -> next to the 27B target GGUF (Qwen3.8-27B-GGUF/)
+cmd_download() {
+  local recipe="${1:-}"
+  local hf_repo hf_rev dest min_free_gib
+  case "$recipe" in
+    flash-next)
+      hf_repo="unsloth/Qwen3.8-Flash-Next-GGUF"
+      hf_rev="38bb39ee97821de2c9009abb7e93950eec396e66"
+      dest="${GUFO_MODELS_DIRS[0]}/qwen3.8-flash-next"
+      min_free_gib=120
+      ;;
+    dflash2-27b)
+      hf_repo="z-lab/Qwen3.8-27B-DFlash2-GGUF"
+      hf_rev="2d9571f8ce46e151f61c6499c99dee6079e1d610"
+      dest="${GUFO_MODELS_DIRS[0]}/Qwen3.8-27B-GGUF"
+      min_free_gib=2
+      ;;
+    "")
+      die "usage: gufo download <flash-next|dflash2-27b>"
+      ;;
+    *)
+      die "unknown download recipe: $recipe (known: flash-next, dflash2-27b)"
+      ;;
+  esac
+
+  command -v hf >/dev/null 2>&1 ||
+    die "needs the 'hf' CLI (Hugging Face Hub CLI): https://huggingface.co/docs/huggingface_hub/guides/cli"
+
+  local parent avail
+  parent=$(dirname "$dest")
+  avail=$(df -BG --output=avail "$parent" | tail -1 | tr -dc '0-9')
+  (( avail >= min_free_gib )) ||
+    die "need >= ${min_free_gib} GB free on $parent, have ${avail} GB"
+
+  mkdir -p "$dest"
+  # The xet transport stalls on some networks; classic HTTP with many workers resumes cleanly.
+  export HF_HUB_DISABLE_XET=1
+
+  # relpath:expected_bytes pairs, verified after download
+  local -a expect
+  case "$recipe" in
+    flash-next)
+      # --include takes ONE pattern; extra files go as positional args (no '--' separator,
+      # which silently skips --local-dir placement).
+      info "downloading $hf_repo UD-Q4_K_XL shards (~111 GB, resumable: rerun on failure)"
+      hf download "$hf_repo" --revision "$hf_rev" \
+        --include "UD-Q4_K_XL/*" --max-workers 16 --local-dir "$dest"
+      info "downloading MTP sidecar (2.8 GB)"
+      hf download "$hf_repo" --revision "$hf_rev" \
+        "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" --local-dir "$dest"
+      expect=(
+        "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf:10946624"
+        "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf:49859583136"
+        "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf:49376141504"
+        "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf:12087983520"
+        "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf:2786568256"
+      )
+      ;;
+    dflash2-27b)
+      info "downloading $hf_repo draft (1.1 GB)"
+      hf download "$hf_repo" --revision "$hf_rev" \
+        "Qwen3.8-27B-DFlash2-Q4_K_M.gguf" --local-dir "$dest"
+      expect=("Qwen3.8-27B-DFlash2-Q4_K_M.gguf:1143006816")
+      ;;
+  esac
+
+  local pair f got fail=0
+  for pair in "${expect[@]}"; do
+    f="${pair%:*}"
+    got=$(stat -c %s "$dest/$f" 2>/dev/null || echo 0)
+    if [ "$got" = "${pair#*:}" ]; then
+      ok "OK   $f"
+    else
+      warn "BAD  $f (want ${pair#*:}, got $got)"; fail=1
+    fi
+  done
+  (( fail == 0 )) || die "size verification failed under $dest"
+
+  case "$recipe" in
+    flash-next)  ok "ready: gufo run flash-next --ctx 32768  (stop other models first: 114 GB weights)" ;;
+    dflash2-27b) ok "ready: gufo run 27b  will now auto-enable DFlash2" ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 gufo — manage GGUF models via Gufo containers, hooked into pi-webui
@@ -709,6 +796,10 @@ usage: gufo <command> [args]
   refresh [name]                  resync served model ids into models.json
   unregister <model|name>         remove provider from models.json only
   diagnose                        run gufo diagnose (GPU/toolchain check)
+  download <flash-next|dflash2-27b>
+                                  fetch a verified model + its speculative sidecar from
+                                  Hugging Face (needs the 'hf' CLI; resumable; checks free
+                                  disk: flash-next ~120 GB, dflash2-27b ~1 GB)
 
 models dirs:   ${GUFO_MODELS_DIRS[*]}
 models.json:   $PI_MODELS_JSON
@@ -730,6 +821,7 @@ case "$cmd" in
   refresh)     cmd_refresh "$@" ;;
   unregister)  cmd_unregister "$@" ;;
   diagnose)    cmd_diagnose "$@" ;;
+  download)    cmd_download "$@" ;;
   help|-h|--help) usage ;;
   *)           printf '%s\n' "unknown command: $cmd" >&2; usage; exit 1 ;;
 esac
