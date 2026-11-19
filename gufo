@@ -25,10 +25,12 @@ GUFO_CTX_DEFAULT=131072
 # on this machine's 32 GiB system pool while loading a 30 GB model file.
 GUFO_RAM_CACHE_DEFAULT=$((4 * 1024 * 1024 * 1024)) # 4 GiB
 GUFO_MAX_DEFAULT=32768
-# Parallel runs per model (gufo serve -j/--sessions). Each session gets its own
-# GPU request slot, so requests stop queueing behind each other; if a model is
-# too big for the memory pool, drop this to 1.
-GUFO_SESSIONS_DEFAULT="${GUFO_SESSIONS_DEFAULT:-2}"
+# Parallel runs per model (gufo serve -j/--sessions). Sessions are real GPU
+# request slots and -c is *per session*, so N sessions reserve N copies of the
+# context: two 262k sessions left only single-digit GB of a 123 GB pool while a
+# 111 GB model was resident. Keep the engine's default and raise it per model
+# when the context is small enough to afford a second one.
+GUFO_SESSIONS_DEFAULT="${GUFO_SESSIONS_DEFAULT:-1}"
 WAIT_TIMEOUT=900                                  # max seconds to wait for model load
 CONTAINER_PREFIX="gufo-"
 
@@ -1073,9 +1075,10 @@ usage: gufo <command> [args]
                                   baked into the GGUF); use a stable id when another app
                                   lists models and forwards requests back to us
       --api-key KEY               require this bearer key in the container
-      --sessions N  (-j)          parallel runs per model, i.e. concurrent requests
-                                  that do not queue behind each other (default: $GUFO_SESSIONS_DEFAULT;
-                                  use 1 if a large model cannot allocate)
+      --sessions N  (-j)          parallel runs per model (default: $GUFO_SESSIONS_DEFAULT = the engine
+                                  default). Each session reserves its own -c context, so raise
+                                  this only when there is memory for N contexts: it trades a
+                                  little per-request speed for not queueing behind other clients
       --reasoning MODE            advertise a thinking channel to pi: auto (default: from
                                   GGUF architecture / file name), on or off
       --vision MODE               advertise image input: auto (default: from the running

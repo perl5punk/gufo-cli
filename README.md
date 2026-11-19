@@ -39,8 +39,12 @@ Starting gufo-qwen3-8-27b-ud-q8
   Flash-Next, …) so `/thinking` appears, and `input: ["text","image"]` when a
   vision projector sits beside the model so images can be attached.
   `gufo refresh` re-reads them for a running model.
-- **Parallel runs** — `--sessions N` (default 2) maps to the engine's GPU request
-  sessions, so a second request stops waiting behind the first.
+- **Parallel runs, when you can afford them** — `--sessions N` maps to the
+  engine's preallocated GPU request sessions. Requests then share the engine
+  instead of queueing (each a bit slower), which is worth it for small and
+  medium contexts; `-c` is per session, so two 262k sessions on a 111 GB model
+  reserve two full contexts and there isn't room. Default stays at the engine's
+  own `1`.
 - **Observability** — `status`, `logs`, and `diagnose` subcommands; the
   container logs report per-request `decode_tps`, `prefill_tps`, TTFT and
   draft acceptance (see [Watching tokens/sec](#watching-tokenssec)).
@@ -121,7 +125,7 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `--speculative MODE [GGUF]` | `auto` | Draft backend: `auto`, `off`, `mtp`, `dflash2`, `dspark`; optional explicit sidecar path |
 | `--draft-tokens N` | 7 (1–7) | Draft cap per step |
 | `--draft-policy POLICY` | engine default | DFlash2 block policy: `fixed` or `adaptive` |
-| `--sessions N` (`-j`) | 2 | Parallel runs per model — concurrent requests that don't queue behind each other. Use `1` if a big model can't allocate the extra per-session state |
+| `--sessions N` (`-j`) | 1 (engine default) | Parallel runs per model. Each session reserves its **own** `--ctx` worth of KV, so raise it only when the memory is there for N contexts |
 | `--reasoning MODE` | `auto` | Advertise a thinking channel to pi: `auto` (from GGUF architecture, else file name), `on`, `off` |
 | `--vision MODE` | `auto` | Advertise image input: `auto` (from the running model, else an `*mmproj*.gguf` beside it), `on`, `off` |
 | `--served-name ID` | GGUF `general.name` | Model id exposed by the OpenAI API (use a stable id when another app lists models and forwards requests back to you) |

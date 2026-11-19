@@ -135,27 +135,45 @@ a client-side timeout), and warm models with `load`/`autostart`.
 
 ## A model is loaded, but requests take minutes
 
-Not a cold start: Gufo runs one request per *session*, so a second client waits
-for the first to finish. The container log shows it plainly —
-`queue_ms=501751 ttft_ms=501930` means five minutes spent queueing, not thinking:
+Not a cold start. Gufo executes one request per *session*, so with the default
+single session a second client waits for the first to finish. The container log
+separates waiting from working — `queue_ms=501751 ttft_ms=501930` is five minutes
+in a queue and two seconds of thinking:
 
 ```bash
-gufo logs gufo-qwen3-8-flash-next-ud-q4-k-xl --no-follow | tail -3   # queue_depth, queue_ms
+gufo logs <container> --no-follow | tail -3      # queue_depth, queue_ms, batch_width
 ```
 
-The bridge launches containers with `sessions: 2`, which lets two requests run at
-once; raise it (or lower it for a model that cannot allocate the extra state):
+The knob is `sessions` (per model, not globally), and it is a memory trade:
+**`-c/--context` applies per session**, so N sessions reserve N copies of the
+context. The engine's own accounting says it at load time:
+
+```
+[loader] load_completed sessions=1 context_tokens=262144 host_available_mib=29637
+```
+
+On this machine a 111 GB checkpoint leaves ~13 GB of the 123 GB pool once it is
+resident, so a second 262k session is not available; asking for it risks the load
+or the host, and buys nothing. Set it where the context is cheap:
 
 ```json
-{ "sessions": 4 }
+{
+  "sessions": 1,
+  "model_overrides": {
+    "Qwen3-4B-Q4_K_M": {"ctx": 32768, "sessions": 4}
+  }
+}
 ```
 
 ```bash
-systemctl --user restart gufo-lemonade     # applies to the next container start
+systemctl --user restart gufo-lemonade        # applies to the next container start
+gufo-lemonade unload <model>                  # let the next request apply it sooner
 ```
 
-Existing containers keep whatever they were started with — `gufo-lemonade unload
-<model>` and let the next request start it with the new value.
+Two running requests share the engine, so each finishes a little slower than it
+would alone — the win is that neither waits minutes behind a long generation.
+If many clients hammer one big model, that model needs its own container
+(`gufo run <model> --name second --port N`) more than it needs more sessions.
 
 ## Streaming works directly but not through Lemonade
 

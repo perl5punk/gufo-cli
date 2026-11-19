@@ -177,7 +177,7 @@ noted (a restart is always safe: `systemctl --user restart gufo-lemonade`).
 | `ctx` | `131072` | context cap, clipped to each model's native window |
 | `ram_cache_bytes` | `4294967296` | passed to `gufo run --ram-cache` |
 | `speculative` | `auto` | `auto`/`off`/`mtp`/`dflash2`/`dspark` |
-| `sessions` | `2` | Parallel runs per model (`gufo serve --sessions`): how many requests execute instead of queueing. `0` omits the flag, `1` for models that can't allocate the extra per-session state |
+| `sessions` | `1` | Parallel runs per model (`gufo serve --sessions`): requests share the engine instead of queueing, each a bit slower. Every session reserves its own `ctx`, so set this per model, not globally (`0` omits the flag) |
 | `detect_capabilities` | `true` | Refine `supports` per model: reasoning only for thinking architectures (qwen3/qwen35/qwen4exp/…), image input when an `*mmproj*.gguf` sits beside the model |
 | `use_served_names` | `true` | serve each container under the published id (`gufo run --served-name`), not the GGUF's internal name |
 | `container_api_key` | `""` | optional bearer key required *inside* containers |
@@ -203,12 +203,17 @@ mark a vision model:
   "idle_timeout_min": 45,
   "autostart": ["Qwen3.8-27B-UD-Q4_K_M"],
   "model_overrides": {
-    "Qwen3.8-Flash-Next-UD-Q4_K_XL": {"ctx": 262144},
+    "Qwen3.8-Flash-Next-UD-Q4_K_XL": {"ctx": 262144, "sessions": 1},
+    "Qwen3-4B-Q4_K_M": {"ctx": 32768, "sessions": 4},
     "scratch-export": {"hidden": true},
     "Qwen3-VL-30B-Q4_K_M": {"image_input": true}
   }
 }
 ```
+
+`sessions` is the one worth tuning per model: it is how many requests run at once
+instead of queueing, and each session reserves its own `ctx`. A 4B model at 32k
+can carry four; a 111 GB model at 262k cannot carry two.
 
 Model **capabilities** are published per model, so Lemonade labels models
 `tool-calling` / `reasoning` correctly and the app hides image input for text-only

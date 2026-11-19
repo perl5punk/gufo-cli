@@ -356,8 +356,10 @@ class TestCapabilities(unittest.TestCase):
 
 
 class TestParallelRuns(unittest.TestCase):
-    def test_two_runs_by_default(self):
-        self.assertEqual(2, gl.DEFAULTS["sessions"])
+    def test_engine_default_runs_by_default(self):
+        # One session reserves one full context; a global 2 would price out the
+        # big models that need the memory most.
+        self.assertEqual(1, gl.DEFAULTS["sessions"])
 
 
 class TestLaunchCommand(unittest.TestCase):
@@ -381,7 +383,7 @@ class TestLaunchCommand(unittest.TestCase):
             required, optional = engine.launch_command(entry, 13400)
             argv = required + optional
             self.assertEqual("run", argv[1])
-            self.assertEqual("2", argv[argv.index("--sessions") + 1])
+            self.assertEqual("1", argv[argv.index("--sessions") + 1])
             self.assertIn("--no-register", argv)          # never touch pi's config
             self.assertEqual("13400", argv[argv.index("--port") + 1])
 
@@ -389,6 +391,12 @@ class TestLaunchCommand(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             engine, entry = self.engine(sessions=0), self.entry(tmp)
             self.assertNotIn("--sessions", engine.launch_command(entry, 13400)[1])
+
+    def test_more_runs_are_requested_when_asked_for(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, entry = self.engine(sessions=4), self.entry(tmp)
+            optional = engine.launch_command(entry, 13400)[1]
+            self.assertEqual("4", optional[optional.index("--sessions") + 1])
 
     def test_served_name_keeps_ids_stable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -401,6 +409,16 @@ class TestLaunchCommand(unittest.TestCase):
             engine, entry = self.engine(container_api_key="sekret"), self.entry(tmp)
             optional = engine.launch_command(entry, 13400)[1]
             self.assertEqual("sekret", optional[optional.index("--api-key") + 1])
+
+    def test_sessions_are_per_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = self.entry(tmp)
+            cfg = json.loads(json.dumps(gl.DEFAULTS))
+            cfg["model_overrides"] = {"Some-Model": {"sessions": 3}}
+            engine = self.engine()
+            engine.cfg = cfg
+            optional = engine.launch_command(entry, 13400)[1]
+            self.assertEqual("3", optional[optional.index("--sessions") + 1])
 
     def test_required_part_alone_is_a_valid_run(self):
         with tempfile.TemporaryDirectory() as tmp:

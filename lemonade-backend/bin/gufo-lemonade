@@ -83,10 +83,11 @@ DEFAULTS = {
     "ctx": 131072,
     "ram_cache_bytes": 4 * 1024 * 1024 * 1024,
     "speculative": "auto",
-    # Parallel runs per model (`gufo serve --sessions`). Two means two requests
-    # execute instead of the second waiting for the first; drop to 1 if a big
-    # model cannot allocate the extra per-session state.
-    "sessions": 2,
+    # Parallel runs per model (`gufo serve --sessions`). Each session reserves its
+    # own `ctx` worth of KV, so this is a per-model decision, not a global one:
+    # two 262k sessions cost memory that a 111 GB checkpoint does not leave.
+    # Raise it per model via model_overrides -> {"<id>": {"sessions": 2}}.
+    "sessions": 1,
     # --- Lemonade registration ------------------------------------------------
     # The cloud recipe insists on an API key; Gufo ignores whatever it gets. The
     # key only has to be visible to lemond, and lemond keeps CLI-supplied keys in
@@ -670,7 +671,8 @@ class Engine:
             "--speculative", str(self.cfg.get("speculative", "auto")),
         ]
         optional = (["--served-name", entry.id] if self.cfg.get("use_served_names", True) else [])
-        sessions = int(self.cfg.get("sessions") or 0)
+        override = self.cfg.get("model_overrides", {}).get(entry.id, {})
+        sessions = int(override.get("sessions") or self.cfg.get("sessions") or 0)
         if sessions > 0:
             optional += ["--sessions", str(sessions)]
         key = str(self.cfg.get("container_api_key") or "")
