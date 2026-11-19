@@ -133,6 +133,30 @@ has its own timeout, so a cold model looks like a hang. Keep
 `start_wait_seconds` *below* that timeout (the 503 above is far more useful than
 a client-side timeout), and warm models with `load`/`autostart`.
 
+## A model is loaded, but requests take minutes
+
+Not a cold start: Gufo runs one request per *session*, so a second client waits
+for the first to finish. The container log shows it plainly —
+`queue_ms=501751 ttft_ms=501930` means five minutes spent queueing, not thinking:
+
+```bash
+gufo logs gufo-qwen3-8-flash-next-ud-q4-k-xl --no-follow | tail -3   # queue_depth, queue_ms
+```
+
+The bridge launches containers with `sessions: 2`, which lets two requests run at
+once; raise it (or lower it for a model that cannot allocate the extra state):
+
+```json
+{ "sessions": 4 }
+```
+
+```bash
+systemctl --user restart gufo-lemonade     # applies to the next container start
+```
+
+Existing containers keep whatever they were started with — `gufo-lemonade unload
+<model>` and let the next request start it with the new value.
+
 ## Streaming works directly but not through Lemonade
 
 The bridge proxies SSE unchanged. If you put nginx/Caddy/Traefik in front of

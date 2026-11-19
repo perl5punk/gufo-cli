@@ -25,6 +25,10 @@ GUFO_CTX_DEFAULT=131072
 # on this machine's 32 GiB system pool while loading a 30 GB model file.
 GUFO_RAM_CACHE_DEFAULT=$((4 * 1024 * 1024 * 1024)) # 4 GiB
 GUFO_MAX_DEFAULT=32768
+# Parallel runs per model (gufo serve -j/--sessions). Each session gets its own
+# GPU request slot, so requests stop queueing behind each other; if a model is
+# too big for the memory pool, drop this to 1.
+GUFO_SESSIONS_DEFAULT="${GUFO_SESSIONS_DEFAULT:-2}"
 WAIT_TIMEOUT=900                                  # max seconds to wait for model load
 CONTAINER_PREFIX="gufo-"
 
@@ -113,6 +117,139 @@ model_dir_for() {
 }
 
 # First GGUF under <dir> (maxdepth 3) matching one of the name patterns, skipping <target>
+# GGUF key/value probe. The engine has no metadata command, so read the header
+# directly. python3 is optional: without it the callers fall back to name
+# heuristics. Prints the value of key "" (missing key -> no output).
+gguf_key() { # <path> <key>
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import struct, sys
+
+# GGUF v2/v3 header: magic, version, n_tensors, n_kv, then n_kv key/value pairs.
+TYPES = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?",
+         10: "Q", 11: "q", 12: "d"}
+STRING, ARRAY = 8, 9
+
+
+def main() -> None:
+    path, want = sys.argv[1], sys.argv[2]
+    with open(path, "rb") as fh:
+        blob = fh.read(4 * 1024 * 1024)      # general.architecture is always early
+    if blob[:4] != b"GGUF" or struct.unpack_from("<I", blob, 4)[0] < 2:
+        return
+    n = struct.unpack_from("<Q", blob, 16)[0]
+    if n > 100000:                            # implausible: mis-parse
+        return
+    off = 24
+
+    def string(i):
+        ln = struct.unpack_from("<Q", blob, i)[0]
+        if ln > 64 * 1024 * 1024:
+            raise ValueError("string too long")
+        return blob[i + 8:i + 8 + ln].decode("utf-8", "replace"), i + 8 + ln
+
+    for _ in range(n):
+        key, off = string(off)
+        kind = struct.unpack_from("<I", blob, off)[0]
+        off += 4
+        code = TYPES.get(kind)
+        if code == "?":
+            val = blob[off]; off += 1
+        elif code is not None:
+            size = struct.calcsize(code)
+            val = struct.unpack_from(code, blob, off)[0]; off += size
+        elif kind == STRING:
+            val, off = string(off)
+        elif kind == ARRAY:
+            elem = struct.unpack_from("<I", blob, off)[0]; off += 4
+            count = struct.unpack_from("<Q", blob, off)[0]; off += 8
+            if count > 8000000:
+                return
+            if elem == STRING:
+                for _ in range(count):               # token tables: walk, don't keep
+                    _, off = string(off)
+            else:
+                e = TYPES.get(elem)
+                if e is None:
+                    return
+                off += count * struct.calcsize(e)
+        else:
+            return                                   # unknown type: stop scanning
+        if key == want:
+            print(val)
+            return
+
+
+main()
+PY
+}
+
+# Model families whose checkpoints answer in a thinking channel. Qwen3 and the
+# qwen35/qwen4exp (Flash-Next) variants are hybrid-thinking by construction.
+REASONING_ARCHS="qwen3 qwen35 qwen3next qwen4 qwen4exp qwq deepseek_r1 kimi_k2 minimax_m2"
+
+is_reasoning_arch() { # <architecture> -> 0 when the family thinks
+  local arch="${1,,}" a
+  for a in $REASONING_ARCHS; do
+    [ "$arch" = "$a" ] && return 0
+  done
+  return 1
+}
+
+# Capability guess from file names, used when GGUF metadata is unavailable.
+name_suggests_reasoning() { # <model path or name>
+  local n="${1,,}"
+  case "$n" in
+    *nothink*|*non-thinking*) return 1 ;;
+  esac
+  case "$n" in
+    *qwen3*|*qwen4*|*qwq*|*r1*|*think*|*reason*) return 0 ;;
+  esac
+  return 1
+}
+
+# <auto|on|off> -> on/off, resolved from GGUF metadata (fallback: file name).
+detect_reasoning() { # <model path> <mode>
+  local mode="$2" arch
+  case "$mode" in
+    on)  printf 'on';  return 0 ;;
+    off) printf 'off'; return 0 ;;
+  esac
+  arch=$(gguf_key "$1" general.architecture)
+  if [ -n "$arch" ]; then
+    is_reasoning_arch "$arch" && printf 'on' || printf 'off'
+  else
+    name_suggests_reasoning "$1" && printf 'on' || printf 'off'
+  fi
+}
+
+# Vision needs a projector sidecar, which the engine auto-discovers beside the
+# model; a running container is the authority once it is up.
+detect_vision() { # <model path> <mode> [port]
+  local mode="$2" port="${3:-}" mods
+  case "$mode" in
+    on)  printf 'on';  return 0 ;;
+    off) printf 'off'; return 0 ;;
+  esac
+  if [ -n "$port" ]; then
+    mods=$(curl -fsS --max-time 5 "http://127.0.0.1:$port/v1/models" 2>/dev/null \
+             | jq -r '.data[0].architecture.input_modalities[]?' 2>/dev/null | tr '\n' ' ')
+    case "${mods,,}" in *image*) printf 'on'; return 0 ;; esac
+    [ -n "$mods" ] && { printf 'off'; return 0; }
+  fi
+  find_sidecar "$(dirname "$1")" "$1" '*mmproj*.gguf' >/dev/null 2>&1 && printf 'on' || printf 'off'
+}
+
+# Host path of the GGUF a container serves (from its mount + serve args).
+container_model_path() { # <name>
+  local cpath root
+  cpath=$(podman inspect -f '{{join .Config.Cmd " "}}' "$1" 2>/dev/null \
+            | grep -oE -- '--model[ =][^ ]+' | sed -E 's/^--model[ =]?//' || true)
+  [ -n "$cpath" ] || return 0
+  root=$(podman inspect -f '{{range .Mounts}}{{if eq .Destination "/models"}}{{.Source}}{{end}}{{end}}' "$1" 2>/dev/null)
+  [ -n "$root" ] && printf '%s%s\n' "$root" "${cpath#/models}" || printf '%s\n' "$cpath"
+}
+
 find_sidecar() {
   local dir="$1" target="$2" pat f
   shift 2
@@ -138,11 +275,32 @@ free_port() {
   printf '%s\n' "$p"
 }
 
-c_name() { printf '%s%s' "$CONTAINER_PREFIX" "$(slugify "$1")"; }
+# Accepts a model query, a path, or an existing container name (refresh, stop
+# and logs all take any of them) without prefixing twice.
+c_name() {
+  local s
+  if [ -n "${1:-}" ] && podman inspect "$1" >/dev/null 2>&1; then
+    printf '%s\n' "$1"
+    return 0
+  fi
+  s=$(slugify "${1:-}")
+  case "$s" in
+    "$CONTAINER_PREFIX"*) printf '%s\n' "$s" ;;
+    *)                    printf '%s%s\n' "$CONTAINER_PREFIX" "$s" ;;
+  esac
+}
 provider_name() { printf '%s%s' "$CONTAINER_PREFIX" "$(slugify "$1")"; }
 
 require_container() {
   podman inspect "$1" >/dev/null 2>&1 || die "container '$1' not found (see: gufo models / gufo status)"
+}
+
+# Parallel runs a container was started with (the engine defaults to 1).
+container_sessions() { # <name>
+  local s
+  s=$(podman inspect -f '{{join .Config.Cmd " "}}' "$1" 2>/dev/null \
+        | grep -oE -- '--sessions[ =][0-9]+' | grep -oE '[0-9]+' | head -1 || true)
+  printf '%s\n' "${s:-1}"
 }
 
 container_running() {
@@ -219,20 +377,34 @@ backup_models_json() {
   cp -f "$PI_MODELS_JSON" "$PI_MODELS_JSON.bak"
 }
 
-register_model() { # <provider> <baseUrl> <modelId> <displayName> <ctx> <max> [oldId]
-  local prov="$1" base="$2" id="$3" name="$4" ctx="$5" max="$6" oldid="${7:-}" tmp
+# Capabilities matter: pi only offers thinking levels when `reasoning` is set,
+# and only attaches images when `input` says the model takes them. A model
+# registered without them looks text-only and non-thinking in the picker.
+capabilities_json() { # <reasoning on|off> <vision on|off> -> jq filter fragment
+  local reasoning="$1" vision="$2"
+  # Normalise through jq so callers can compare the fragment verbatim.
+  printf '{"reasoning": %s, "input": %s}' \
+    "$([ "$reasoning" = on ] && echo true || echo false)" \
+    "$([ "$vision" = on ] && echo '["text","image"]' || echo '["text"]')" | jq -c .
+}
+
+register_model() { # <provider> <baseUrl> <modelId> <displayName> <ctx> <max> [reasoning] [vision] [oldId]
+  local prov="$1" base="$2" id="$3" name="$4" ctx="$5" max="$6" oldid="${9:-}"
+  local caps
+  caps=$(capabilities_json "${7:-off}" "${8:-off}")
   require_models_json
   backup_models_json
+  local tmp
   tmp=$(mktemp)
   jq --arg p "$prov" --arg base "$base" --arg id "$id" --arg name "$name" \
-     --argjson ctx "$ctx" --argjson max "$max" --arg oldid "$oldid" '
+     --argjson ctx "$ctx" --argjson max "$max" --arg oldid "$oldid" --argjson caps "$caps" '
     .providers[$p] = ((.providers[$p] // {models: []}) | {
       baseUrl: $base,
       api: "openai-completions",
       apiKey: "gufo-local",
       models: ((.models // []) | map(select(.id != $id and .id != $oldid)))
     })
-    | .providers[$p].models += [{id: $id, name: $name, contextWindow: $ctx, maxTokens: $max}]
+    | .providers[$p].models += [{id: $id, name: $name, contextWindow: $ctx, maxTokens: $max} + $caps]
   ' "$PI_MODELS_JSON" > "$tmp"
   mv "$tmp" "$PI_MODELS_JSON"
 }
@@ -360,6 +532,7 @@ cmd_run() {
   local ctx=$GUFO_CTX_DEFAULT max=$GUFO_MAX_DEFAULT ram_cache=$GUFO_RAM_CACHE_DEFAULT
   local spec_mode=auto spec_path="" draft_tokens="" draft_policy=""
   local served_name="" api_key=""
+  local sessions=$GUFO_SESSIONS_DEFAULT reasoning_mode=auto vision_mode=auto
   local tailscale=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -375,6 +548,9 @@ cmd_run() {
       --draft-policy) draft_policy="${2:-}"; shift 2 ;;
       --served-name|--served-model-name) served_name="${2:-}"; shift 2 ;;
       --api-key)     api_key="${2:-}"; shift 2 ;;
+      --sessions|-j) sessions="${2:-}"; shift 2 ;;
+      --reasoning)   reasoning_mode="${2:-}"; shift 2 ;;
+      --vision)      vision_mode="${2:-}"; shift 2 ;;
       --no-register) register=0; shift ;;
       --skip-device-check) skip_devcheck=1; shift ;;
       --tailscale)   tailscale=1; shift ;;
@@ -392,6 +568,15 @@ cmd_run() {
   fi
   if [[ ! "$spec_mode" =~ ^(auto|off|mtp|dflash2|dspark)$ ]]; then
     die "invalid --speculative '$spec_mode' (expected auto, off, mtp, dflash2 or dspark)"
+  fi
+  if [[ ! "$sessions" =~ ^[1-9][0-9]*$ ]]; then
+    die "--sessions must be a positive integer (got '$sessions')"
+  fi
+  if [[ ! "$reasoning_mode" =~ ^(auto|on|off)$ ]]; then
+    die "invalid --reasoning '$reasoning_mode' (expected auto, on or off)"
+  fi
+  if [[ ! "$vision_mode" =~ ^(auto|on|off)$ ]]; then
+    die "invalid --vision '$vision_mode' (expected auto, on or off)"
   fi
   command -v podman >/dev/null || die "podman not found in PATH"
   if [ "$tailscale" = 1 ]; then
@@ -503,6 +688,7 @@ cmd_run() {
   info "  spec:   $spec_label"
   info "  image:  $image"
   info "  port:   127.0.0.1:$port"
+  info "  runs:   $sessions parallel session(s)"
   [ -n "$served_name" ] && info "  id:     $served_name (served model name)"
   if ! podman run -d --name "$name" \
     "${GPU_FLAGS[@]}" \
@@ -510,7 +696,8 @@ cmd_run() {
     -p 127.0.0.1:${port}:${port} \
     "$image" \
     gufo serve llm --model "$cpath" --host 0.0.0.0 --port "$port" \
-      -c "$ctx" --cache-ram-bytes "$ram_cache" "${SPEC_ARGS[@]}" "${SERVE_IDENTITY_ARGS[@]}" >/dev/null; then
+      -c "$ctx" --sessions "$sessions" --cache-ram-bytes "$ram_cache" \
+      "${SPEC_ARGS[@]}" "${SERVE_IDENTITY_ARGS[@]}" >/dev/null; then
     die "podman run failed"
   fi
 
@@ -523,12 +710,18 @@ cmd_run() {
   fi
   ok "ready: model id '$id' on http://127.0.0.1:$port/v1"
 
+  local reasoning vision
+  reasoning=$(detect_reasoning "$path" "$reasoning_mode")
+  vision=$(detect_vision "$path" "$vision_mode" "$port")
+
   if [ "$register" = 1 ]; then
     local prov display
     prov=$(provider_name "$path")
     display="$(basename "$path" .gguf) (Gufo Local)"
-    register_model "$prov" "http://127.0.0.1:${port}/v1" "$id" "$display" "$ctx" "$max"
+    register_model "$prov" "http://127.0.0.1:${port}/v1" "$id" "$display" "$ctx" "$max" \
+      "$reasoning" "$vision"
     ok "registered as provider '$prov' in $PI_MODELS_JSON (backup: .bak)"
+    info "  caps:   reasoning=$reasoning vision=$vision (override: --reasoning/--vision)"
     info "pi-webui picks it up automatically — open the model picker in your browser."
   else
     info "skipped registration (--no-register)"
@@ -607,6 +800,7 @@ cmd_status() {
       port=$(container_host_port "$n")
       if [ -n "$port" ]; then
         printf '    port: http://127.0.0.1:%s/v1\n' "$port"
+        printf '    runs: %s parallel\n' "$(container_sessions "$n")"
         id=$(served_model_id "$port") || true
         if [ -n "$id" ]; then
           printf '    model: %s\n' "$id"
@@ -616,7 +810,10 @@ cmd_status() {
         fi
       fi
       if [ -f "$PI_MODELS_JSON" ] && is_registered "$n"; then
-        printf '    registered in models.json: %syes%s\n' "$c_grn" "$c_rst"
+        # Keep this jq call on one line: a newline inside $( ) starts a new command.
+        local caps
+        caps=$(jq -r --arg p "$n" '.providers[$p].models[0] | "reasoning=\(.reasoning // false) input=\((.input // ["text"]) | join("+"))"' "$PI_MODELS_JSON" 2>/dev/null || true)
+        printf '    registered in models.json: %syes%s (%s)\n' "$c_grn" "$c_rst" "$caps"
       else
         printf '    registered in models.json: %sno%s\n' "$c_ylw" "$c_rst"
       fi
@@ -708,19 +905,41 @@ cmd_refresh() {
     warn "provider '$n' is not registered in models.json (use: gufo run)"
     return 0
   fi
+  # Re-detect what the model can do, so pi's thinking levels and image
+  # attachments follow the model instead of whatever was written at first run.
+  local path reasoning vision caps cur
+  path=$(container_model_path "$n")
+  if [ -n "$path" ] && [ -f "$path" ]; then
+    reasoning=$(detect_reasoning "$path" auto)
+    vision=$(detect_vision "$path" auto "$port")
+  else
+    # Cannot see the GGUF (moved, or another host serves it): keep the entry's
+    # current capabilities rather than guessing them away.
+    reasoning=$([ "$(jq -r --arg p "$n" '.providers[$p].models[0].reasoning // false' "$PI_MODELS_JSON")" = true ] && echo on || echo off)
+    vision=$([ "$(jq -r --arg p "$n" '(.providers[$p].models[0].input // ["text"]) | index("image") != null' "$PI_MODELS_JSON")" = true ] && echo on || echo off)
+  fi
+  caps=$(capabilities_json "$reasoning" "$vision")
+
   oldid=$(jq -r --arg p "$n" '.providers[$p].models[0].id // empty' "$PI_MODELS_JSON")
-  if [ "$oldid" = "$id" ]; then
-    info "$n: already up to date ('$id')"
+  cur=$(jq -c --arg p "$n" '.providers[$p].models[0]
+              | {reasoning: (.reasoning // false), input: (.input // ["text"])}' "$PI_MODELS_JSON")
+  if [ "$oldid" = "$id" ] && [ "$cur" = "$caps" ]; then
+    info "$n: already up to date ('$id', $cur)"
     return 0
   fi
   backup_models_json
   local tmp
   tmp=$(mktemp)
-  jq --arg p "$n" --arg oldid "$oldid" --arg newid "$id" '
-    .providers[$p].models |= map(if .id == $oldid then .id = $newid else . end)
+  jq --arg p "$n" --arg oldid "$oldid" --arg newid "$id" --argjson caps "$caps" '
+    .providers[$p].models |= map((if .id == $oldid then .id = $newid else . end) + $caps)
   ' "$PI_MODELS_JSON" > "$tmp"
   mv "$tmp" "$PI_MODELS_JSON"
-  ok "$n: model id updated '$oldid' -> '$id'"
+  if [ "$oldid" != "$id" ]; then
+    ok "$n: model id updated '$oldid' -> '$id'"
+  fi
+  if [ "$cur" != "$caps" ]; then
+    ok "$n: capabilities updated $cur -> $caps"
+  fi
 }
 
 cmd_unregister() {
@@ -854,6 +1073,13 @@ usage: gufo <command> [args]
                                   baked into the GGUF); use a stable id when another app
                                   lists models and forwards requests back to us
       --api-key KEY               require this bearer key in the container
+      --sessions N  (-j)          parallel runs per model, i.e. concurrent requests
+                                  that do not queue behind each other (default: $GUFO_SESSIONS_DEFAULT;
+                                  use 1 if a large model cannot allocate)
+      --reasoning MODE            advertise a thinking channel to pi: auto (default: from
+                                  GGUF architecture / file name), on or off
+      --vision MODE               advertise image input: auto (default: from the running
+                                  model, else an *mmproj*.gguf beside it), on or off
       --no-register               container only, skip models.json
       --skip-device-check         don't verify container GPU device access before start
       --tailscale                 expose endpoint on the tailnet via 'tailscale serve'
@@ -865,7 +1091,7 @@ usage: gufo <command> [args]
   status                          containers, ports, model ids, registration
   logs [name] [--no-follow]       tail container logs
   prompt <model> "text" [opts]    one-shot generation (--max-tokens N)
-  refresh [name]                  resync served model ids into models.json
+  refresh [name]                  resync served model id + capabilities into models.json
   unregister <model|name>         remove provider from models.json only
   diagnose                        run gufo diagnose (GPU/toolchain check)
   download <flash-next|dflash2-27b>

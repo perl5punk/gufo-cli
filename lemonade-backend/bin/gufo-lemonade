@@ -83,6 +83,10 @@ DEFAULTS = {
     "ctx": 131072,
     "ram_cache_bytes": 4 * 1024 * 1024 * 1024,
     "speculative": "auto",
+    # Parallel runs per model (`gufo serve --sessions`). Two means two requests
+    # execute instead of the second waiting for the first; drop to 1 if a big
+    # model cannot allocate the extra per-session state.
+    "sessions": 2,
     # --- Lemonade registration ------------------------------------------------
     # The cloud recipe insists on an API key; Gufo ignores whatever it gets. The
     # key only has to be visible to lemond, and lemond keeps CLI-supplied keys in
@@ -118,6 +122,10 @@ DEFAULTS = {
     # Lemonade gates request inputs on these labels. Report what the engine
     # actually serves; image input is opt-in per model below.
     "supports": {"tools": True, "reasoning": True, "image_input": False},
+    # Refine `supports` per model: reasoning only when the checkpoint's
+    # architecture is a thinking family, image input when a vision projector
+    # (*mmproj*.gguf) sits beside the model. Set false to trust `supports` alone.
+    "detect_capabilities": True,
     # Per-model overrides: {"<Model id>": {"ctx": 32768, "image_input": true,
     #                                       "hidden": true, "title": "..."}}
     "model_overrides": {},
@@ -268,6 +276,27 @@ SHARD_RE = re.compile(r"^(?P<base>.+?)[-__.](?P<idx>\d{4,})-of-(?P<total>\d{4,})
 SIDECAR_RE = re.compile(r"(^|[-_.])(mtp[-_.].*|.*dflash2.*|.*dspark.*|.*mmproj.*)$", re.I)
 
 
+# Families whose checkpoints answer in a thinking channel. Matches the heuristic
+# in the gufo CLI, so Lemonade and pi describe a model the same way.
+REASONING_ARCHS = {"qwen3", "qwen35", "qwen3next", "qwen4", "qwen4exp",
+                   "qwq", "deepseek_r1", "kimi_k2", "minimax_m2"}
+
+MMPROJ_RE = re.compile(r"mmproj", re.I)
+
+
+def has_vision_projector(path: Path) -> bool:
+    """True when a *mmproj*.gguf sits next to the model: `gufo serve` picks it
+    up automatically, which is what makes the model able to take images."""
+    try:
+        return any(MMPROJ_RE.search(p.name) for p in path.parent.glob("*mmproj*.gguf"))
+    except OSError:
+        return False
+
+
+def arch_supports_reasoning(arch: str) -> bool:
+    return str(arch or "").strip().lower() in REASONING_ARCHS
+
+
 def normalize(name: str) -> str:
     """Separator/case-insensitive form, for forgiving model lookups."""
     return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
@@ -301,6 +330,7 @@ class ModelEntry:
         self.last_used = 0.0
         arch = meta.get("general.architecture") or ""
         self.arch = arch if isinstance(arch, str) else ""
+        self.has_mmproj = has_vision_projector(path)
         ctx = gguf_context_length(meta)
         self.native_ctx = ctx
 
@@ -316,16 +346,37 @@ class ModelEntry:
             return min(cap, self.native_ctx)
         return cap or self.native_ctx or 0
 
-    def to_model_card(self, cfg: dict) -> dict:
+    def capabilities(self, cfg: dict) -> dict:
+        """What this model can do, as Lemonade and pi need it stated.
+
+        Priority: per-model override, then `supports`, then detection from the
+        checkpoint (thinking architecture, vision projector beside it).
+        """
         supports = cfg.get("supports", {})
         ov = cfg.get("model_overrides", {}).get(self.id, {})
+        detect = bool(cfg.get("detect_capabilities", True))
+        reasoning = ov.get("reasoning")
+        if reasoning is None:
+            reasoning = bool(supports.get("reasoning", False))
+            if detect and self.arch:
+                reasoning = reasoning and arch_supports_reasoning(self.arch)
+        image_input = ov.get("image_input")
+        if image_input is None:
+            image_input = bool(supports.get("image_input", False)) or (
+                detect and self.has_mmproj)
+        return {"tools": bool(ov.get("tools", supports.get("tools", False))),
+                "reasoning": bool(reasoning),
+                "image_input": bool(image_input)}
+
+    def to_model_card(self, cfg: dict) -> dict:
+        caps_list = self.capabilities(cfg)
         ctx = self.effective_ctx(cfg)
         caps = ["chat"]
-        if ov.get("tools", supports.get("tools", False)):
+        if caps_list["tools"]:
             caps.append("tools")
-        if ov.get("reasoning", supports.get("reasoning", False)):
+        if caps_list["reasoning"]:
             caps.append("reasoning")
-        image_input = bool(ov.get("image_input", supports.get("image_input", False)))
+        image_input = caps_list["image_input"]
         card = {
             "id": self.id,
             "object": "model",
@@ -333,8 +384,8 @@ class ModelEntry:
             "owned_by": "gufo",
             "capabilities": caps,
             "supported_parameters": ["tools", "tool_choice", "temperature", "streaming"],
-            "supports_tools": bool(ov.get("tools", supports.get("tools", False))),
-            "supports_reasoning": bool(ov.get("reasoning", supports.get("reasoning", False))),
+            "supports_tools": caps_list["tools"],
+            "supports_reasoning": caps_list["reasoning"],
             "supports_image_input": image_input,
             "architecture": {
                 "modality": "text+image->text" if image_input else "text->text",
@@ -602,26 +653,36 @@ class Engine:
             f"(see: gufo logs {entry.container}); retry in a minute"
         )
 
-    def _start_locked(self, entry: ModelEntry) -> None:
-        port = free_port(int(self.cfg["port_start"]))
-        ctx = entry.effective_ctx(self.cfg) or 131072
-        cmd = [
+    def launch_command(self, entry: ModelEntry, port: int) -> tuple[list[str], list[str]]:
+        """The `gufo run` argv, split into (required, optional) parts.
+
+        Optional holds the newer flags: an older gufo CLI rejects them, and
+        `_forward` still rewrites `model`, so dropping them costs nothing but a
+        prettier id in streamed replies. The container API key is never optional.
+        """
+        required = [
             self.cfg["gufo_bin"], "run", str(entry.path),
             "--no-register",                    # Lemonade, not pi, is the client here
             "--name", entry.container,
             "--port", str(port),
-            "--ctx", str(ctx),
+            "--ctx", str(entry.effective_ctx(self.cfg) or 131072),
             "--ram-cache", str(int(self.cfg["ram_cache_bytes"])),
             "--speculative", str(self.cfg.get("speculative", "auto")),
         ]
-        # Older gufo CLIs (and older runtime images) do not know these flags;
-        # _forward still rewrites `model`, so falling back costs nothing but a
-        # less pretty id inside streamed replies.
-        name_args = ["--served-name", entry.id] if self.cfg.get("use_served_names", True) else []
-        key_args = (["--api-key", str(self.cfg["container_api_key"])]
-                    if self.cfg.get("container_api_key") else [])
-        base_cmd = list(cmd)
-        cmd += name_args + key_args
+        optional = (["--served-name", entry.id] if self.cfg.get("use_served_names", True) else [])
+        sessions = int(self.cfg.get("sessions") or 0)
+        if sessions > 0:
+            optional += ["--sessions", str(sessions)]
+        key = str(self.cfg.get("container_api_key") or "")
+        if key:
+            optional = optional + ["--api-key", key]
+        return required, optional
+
+    def _start_locked(self, entry: ModelEntry) -> None:
+        port = free_port(int(self.cfg["port_start"]))
+        required, optional = self.launch_command(entry, port)
+        cmd = required + optional
+        wanted_key = str(self.cfg.get("container_api_key") or "")
         event = threading.Event()
         self.ready[entry.id] = event
         self.errors.pop(entry.id, None)
@@ -631,11 +692,21 @@ class Engine:
             try:
                 proc = run(cmd, timeout=None)
                 output = (proc.stderr or "") + (proc.stdout or "")
-                if proc.returncode != 0 and name_args and "unknown option" in output:
-                    log("warning: this 'gufo' CLI rejects --served-name; update it "
-                        "(lemonade-backend/install.sh) - starting without it")
+                if proc.returncode != 0 and optional and "unknown option" in output:
+                    if wanted_key:
+                        # Never start a container unauthenticated because the
+                        # CLI was too old to ask for a key.
+                        self._fail(entry.id,
+                                   "this 'gufo' CLI does not support --api-key: update it "
+                                   "(lemonade-backend/install.sh) or clear container_api_key")
+                        return
+                    log("warning: this 'gufo' CLI rejects "
+                        f"{optional[0]} (and friends); update it with "
+                        "lemonade-backend/install.sh - starting without them")
                     self.cfg["use_served_names"] = False
-                    proc = run(base_cmd + key_args, timeout=None)
+                    self.cfg["sessions"] = 0
+                    retry_required, retry_optional = self.launch_command(entry, port)
+                    proc = run(retry_required + retry_optional, timeout=None)
                 if proc.returncode == 0:
                     self.errors.pop(entry.id, None)
                     served = self.probe(port)
@@ -855,6 +926,8 @@ class Bridge:
             "endpoint": bridge_url(self.cfg, "/v1"),
             "provider": self.cfg["provider"],
             "lemond": self.cfg["lemond_url"],
+            "sessions": int(self.cfg.get("sessions") or 0),
+            "detect_capabilities": bool(self.cfg.get("detect_capabilities", True)),
             "models_dirs": self.cfg["models_dirs"],
             "catalog": [
                 {

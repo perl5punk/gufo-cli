@@ -34,7 +34,13 @@ Starting gufo-qwen3-8-27b-ud-q8
   that order. No sidecar → plain autoregressive.
 - **pi-webui integration** — registers a `gufo-<model-slug>` provider
   (OpenAI completions API) in `~/.pi/agent/models.json` with a `.bak` backup on
-  every change; unregisters on `stop`.
+  every change; unregisters on `stop`. The entry carries the model's
+  **capabilities** — `reasoning: true` for thinking families (Qwen3/Qwen3.5/
+  Flash-Next, …) so `/thinking` appears, and `input: ["text","image"]` when a
+  vision projector sits beside the model so images can be attached.
+  `gufo refresh` re-reads them for a running model.
+- **Parallel runs** — `--sessions N` (default 2) maps to the engine's GPU request
+  sessions, so a second request stops waiting behind the first.
 - **Observability** — `status`, `logs`, and `diagnose` subcommands; the
   container logs report per-request `decode_tps`, `prefill_tps`, TTFT and
   draft acceptance (see [Watching tokens/sec](#watching-tokenssec)).
@@ -98,7 +104,7 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `logs [name] [--no-follow]` | Tail container logs (follows by default) |
 | `prompt <model> "text" [--max-tokens N]` | One-shot generation (no container kept) |
 | `gpu` | Check GPU device nodes and container access (udev trap on Ubuntu-family hosts) |
-| `refresh [name]` | Re-read the served model id and resync `models.json` (after swapping GGUF files in place) |
+| `refresh [name]` | Re-read the served model id **and capabilities** and resync `models.json` (after swapping GGUF files in place, or after a capability detection change) |
 | `unregister <model\|name>` | Remove the provider from `models.json` only |
 | `diagnose` | Run `gufo diagnose` in the runtime image (GPU/toolchain check) |
 | `download <recipe>` | Fetch a verified model + speculative sidecar from Hugging Face (`flash-next`, `dflash2-27b`) |
@@ -115,6 +121,9 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `--speculative MODE [GGUF]` | `auto` | Draft backend: `auto`, `off`, `mtp`, `dflash2`, `dspark`; optional explicit sidecar path |
 | `--draft-tokens N` | 7 (1–7) | Draft cap per step |
 | `--draft-policy POLICY` | engine default | DFlash2 block policy: `fixed` or `adaptive` |
+| `--sessions N` (`-j`) | 2 | Parallel runs per model — concurrent requests that don't queue behind each other. Use `1` if a big model can't allocate the extra per-session state |
+| `--reasoning MODE` | `auto` | Advertise a thinking channel to pi: `auto` (from GGUF architecture, else file name), `on`, `off` |
+| `--vision MODE` | `auto` | Advertise image input: `auto` (from the running model, else an `*mmproj*.gguf` beside it), `on`, `off` |
 | `--served-name ID` | GGUF `general.name` | Model id exposed by the OpenAI API (use a stable id when another app lists models and forwards requests back to you) |
 | `--api-key KEY` | none | Require this bearer key in the container |
 | `--image IMG` | `ghcr.io/gufo-org/toolboxes/gufo-runtime:latest` | Runtime image |
@@ -326,7 +335,12 @@ skips it entirely — so the CLI is safe to use without pi installed.
   files must be `*.gguf` within 4 levels of a models dir.
 - **Two quants, one name** — use `--name` + `--port` for the second instance.
 - **Swapped the GGUF file in place?** — restart the container, then
-  `gufo refresh` to sync the new served model id into `models.json`.
+  `gufo refresh` to sync the new served model id and capabilities.
+- **No `/thinking` levels, or images refused in pi** — the registered model entry
+  says what the model can do; run `gufo refresh` to re-detect, or force it with
+  `gufo run --reasoning on` / `--vision on` (then `gufo refresh`). A vision model
+  only reports image input when its `*mmproj*.gguf` projector sits next to it,
+  because that is what the engine auto-loads.
 
 ## License
 

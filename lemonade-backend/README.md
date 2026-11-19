@@ -177,6 +177,8 @@ noted (a restart is always safe: `systemctl --user restart gufo-lemonade`).
 | `ctx` | `131072` | context cap, clipped to each model's native window |
 | `ram_cache_bytes` | `4294967296` | passed to `gufo run --ram-cache` |
 | `speculative` | `auto` | `auto`/`off`/`mtp`/`dflash2`/`dspark` |
+| `sessions` | `2` | Parallel runs per model (`gufo serve --sessions`): how many requests execute instead of queueing. `0` omits the flag, `1` for models that can't allocate the extra per-session state |
+| `detect_capabilities` | `true` | Refine `supports` per model: reasoning only for thinking architectures (qwen3/qwen35/qwen4exp/…), image input when an `*mmproj*.gguf` sits beside the model |
 | `use_served_names` | `true` | serve each container under the published id (`gufo run --served-name`), not the GGUF's internal name |
 | `container_api_key` | `""` | optional bearer key required *inside* containers |
 | `api_key` | `gufo-local` | required bearer key on the bridge (except `/health`); Gufo never sees it |
@@ -207,6 +209,14 @@ mark a vision model:
   }
 }
 ```
+
+Model **capabilities** are published per model, so Lemonade labels models
+`tool-calling` / `reasoning` correctly and the app hides image input for text-only
+checkpoints: `supports_reasoning` follows the checkpoint architecture, and
+`supports_image_input` turns on when a vision projector (`*mmproj*.gguf`) sits
+beside the model — the same rules the `gufo` CLI writes into pi's `models.json`,
+so both apps describe a model identically. `detect_capabilities: false` falls back
+to the flat `supports` block; `model_overrides` always wins.
 
 Model ids come from the file name (`Qwen3.8-27B-UD-Q8_K_XL.gguf` →
 `gufo.Qwen3.8-27B-UD-Q8_K_XL`), stable across restarts. Sharded sets

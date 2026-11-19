@@ -5,6 +5,7 @@
 """
 import importlib.util
 import json
+import types
 import sys
 import tempfile
 import unittest
@@ -275,11 +276,12 @@ class TestConfigContract(unittest.TestCase):
     DOCUMENTED = [
         "host", "port", "provider", "lemond_url", "models_dirs", "max_depth",
         "hide_sidecars", "gufo_bin", "port_start", "ctx", "ram_cache_bytes",
-        "speculative", "use_served_names", "container_api_key", "api_key",
+        "speculative", "sessions", "use_served_names", "container_api_key",
+        "api_key",
         "auto_register", "register_interval_min", "scan_interval_seconds",
         "max_loaded", "evict_before_start", "idle_timeout_min",
         "start_wait_seconds", "retry_backoff_seconds", "autostart", "supports",
-        "model_overrides",
+        "detect_capabilities", "model_overrides",
     ]
 
     def test_every_documented_key_has_a_default(self):
@@ -290,6 +292,122 @@ class TestConfigContract(unittest.TestCase):
         cfg = json.loads(json.dumps(gl.DEFAULTS))
         cfg["supports"]["tools"] = False
         self.assertTrue(gl.DEFAULTS["supports"]["tools"])
+
+
+class TestCapabilities(unittest.TestCase):
+    """`reasoning`/`input` decide whether pi offers thinking and images."""
+
+    CFG = json.loads(json.dumps(gl.DEFAULTS))
+
+    def entry(self, tmp: str, name: str, arch: str, mmproj: bool = False):
+        path = Path(tmp) / name
+        path.write_bytes(b"GGUF")
+        if mmproj:
+            (Path(tmp) / "mmproj-Qwen-Vision.gguf").write_bytes(b"GGUF")
+        return gl.ModelEntry("M", "M", path, 1000,
+                             {"general.architecture": arch} if arch else {})
+
+    def test_thinking_architectures_are_recognised(self):
+        for arch in ("qwen3", "qwen35", "qwen4exp", "QWQ", "deepseek_r1"):
+            self.assertTrue(gl.arch_supports_reasoning(arch), arch)
+
+    def test_unknown_architectures_are_not_claimed(self):
+        for arch in ("llama", "gemma3", "phi3", ""):
+            self.assertFalse(gl.arch_supports_reasoning(arch), arch)
+
+    def test_reasoning_follows_the_architecture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            thinking = self.entry(tmp, "A.gguf", "qwen35")
+            plain = self.entry(tmp, "B.gguf", "gemma3")
+            self.assertTrue(thinking.capabilities(self.CFG)["reasoning"])
+            self.assertFalse(plain.capabilities(self.CFG)["reasoning"])
+
+    def test_vision_needs_a_projector_beside_the_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            without = self.entry(tmp, "A.gguf", "qwen35")
+            self.assertFalse(without.capabilities(self.CFG)["image_input"])
+            with_proj = self.entry(tmp, "B.gguf", "qwen35", mmproj=True)
+            self.assertTrue(with_proj.capabilities(self.CFG)["image_input"])
+
+    def test_overrides_beat_detection(self):
+        cfg = json.loads(json.dumps(self.CFG))
+        cfg["model_overrides"] = {"M": {"reasoning": False, "image_input": True}}
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = self.entry(tmp, "A.gguf", "qwen35")
+            caps = entry.capabilities(cfg)
+            self.assertFalse(caps["reasoning"])
+            self.assertTrue(caps["image_input"])
+
+    def test_detection_can_be_switched_off(self):
+        cfg = json.loads(json.dumps(self.CFG))
+        cfg["detect_capabilities"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = self.entry(tmp, "A.gguf", "gemma3")
+            self.assertTrue(entry.capabilities(cfg)["reasoning"])
+
+    def test_card_labels_match_capabilities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = self.entry(tmp, "A.gguf", "qwen35", mmproj=True)
+            card = entry.to_model_card(self.CFG)
+            self.assertTrue(card["supports_reasoning"])
+            self.assertTrue(card["supports_image_input"])
+            self.assertEqual(card["architecture"]["input_modalities"], ["text", "image"])
+            self.assertIn("reasoning", card["capabilities"])
+
+
+class TestParallelRuns(unittest.TestCase):
+    def test_two_runs_by_default(self):
+        self.assertEqual(2, gl.DEFAULTS["sessions"])
+
+
+class TestLaunchCommand(unittest.TestCase):
+    """The argv handed to `gufo run`, without launching anything."""
+
+    def engine(self, **over):
+        cfg = json.loads(json.dumps(gl.DEFAULTS))
+        cfg.update(over)
+        catalog = types.SimpleNamespace(entries=[])
+        return gl.Engine(cfg, catalog)
+
+    def entry(self, tmp: str):
+        path = Path(tmp) / "Some Model.gguf"
+        path.write_bytes(b"GGUF")
+        return gl.ModelEntry("Some-Model", "Some Model", path, 1000,
+                             {"general.architecture": "qwen35"})
+
+    def test_parallel_runs_are_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, entry = self.engine(), self.entry(tmp)
+            required, optional = engine.launch_command(entry, 13400)
+            argv = required + optional
+            self.assertEqual("run", argv[1])
+            self.assertEqual("2", argv[argv.index("--sessions") + 1])
+            self.assertIn("--no-register", argv)          # never touch pi's config
+            self.assertEqual("13400", argv[argv.index("--port") + 1])
+
+    def test_sessions_can_be_turned_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, entry = self.engine(sessions=0), self.entry(tmp)
+            self.assertNotIn("--sessions", engine.launch_command(entry, 13400)[1])
+
+    def test_served_name_keeps_ids_stable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, entry = self.engine(), self.entry(tmp)
+            optional = engine.launch_command(entry, 13400)[1]
+            self.assertEqual("Some-Model", optional[optional.index("--served-name") + 1])
+
+    def test_container_key_is_never_dropped_quietly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, entry = self.engine(container_api_key="sekret"), self.entry(tmp)
+            optional = engine.launch_command(entry, 13400)[1]
+            self.assertEqual("sekret", optional[optional.index("--api-key") + 1])
+
+    def test_required_part_alone_is_a_valid_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine, entry = self.engine(), self.entry(tmp)
+            required = engine.launch_command(entry, 13400)[0]
+            self.assertEqual(["run", str(entry.path)], required[1:3])
+            self.assertNotIn("--sessions", required)      # retry path drops optional
 
 
 if __name__ == "__main__":
