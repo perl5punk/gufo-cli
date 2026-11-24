@@ -283,15 +283,38 @@ REASONING_ARCHS = {"qwen3", "qwen35", "qwen3next", "qwen4", "qwen4exp",
                    "qwq", "deepseek_r1", "kimi_k2", "minimax_m2"}
 
 MMPROJ_RE = re.compile(r"mmproj", re.I)
+# The engine auto-discovers exactly this name beside the model and validates that
+# the projector belongs to the checkpoint; `gufo run` now resolves and passes
+# --mmproj itself, so this only decides what we advertise.
+MMPROJ_NAME = os.environ.get("GUFO_MMPROJ_NAME", "mmproj-BF16.gguf")
+
+
+def find_vision_projector(path: Path) -> Path | None:
+    """The vision projector for a model, the way `gufo run` resolves it.
+
+    The conventional name beside the model wins, then a case-insensitive
+    *mmproj*.gguf nearby. A projector being present is not proof the model can
+    take images - the engine rejects one that does not match the checkpoint - so
+    callers treat this as a hint and prefer what a running server reports.
+    """
+    try:
+        exact = path.parent / MMPROJ_NAME
+        if exact.is_file():
+            return exact
+        for candidate in sorted(path.parent.iterdir()):
+            if candidate.is_file() and candidate.name.lower() == MMPROJ_NAME.lower():
+                return candidate
+        for candidate in sorted(path.parent.iterdir()):
+            if (candidate.is_file() and candidate.suffix.lower() == ".gguf"
+                    and MMPROJ_RE.search(candidate.name)):
+                return candidate
+    except OSError:
+        return None
+    return None
 
 
 def has_vision_projector(path: Path) -> bool:
-    """True when a *mmproj*.gguf sits next to the model: `gufo serve` picks it
-    up automatically, which is what makes the model able to take images."""
-    try:
-        return any(MMPROJ_RE.search(p.name) for p in path.parent.glob("*mmproj*.gguf"))
-    except OSError:
-        return False
+    return find_vision_projector(path) is not None
 
 
 def arch_supports_reasoning(arch: str) -> bool:
@@ -332,6 +355,9 @@ class ModelEntry:
         arch = meta.get("general.architecture") or ""
         self.arch = arch if isinstance(arch, str) else ""
         self.has_mmproj = has_vision_projector(path)
+        # None until a container for this model has answered /v1/models; after
+        # that, whether it really accepts images (the engine decides).
+        self.serves_images: bool | None = None
         ctx = gguf_context_length(meta)
         self.native_ctx = ctx
 
@@ -363,8 +389,15 @@ class ModelEntry:
                 reasoning = reasoning and arch_supports_reasoning(self.arch)
         image_input = ov.get("image_input")
         if image_input is None:
-            image_input = bool(supports.get("image_input", False)) or (
-                detect and self.has_mmproj)
+            if self.running and self.serves_images is not None:
+                # A loaded model is known definitively: the engine only wires up
+                # a projector that matches the checkpoint, so a leftover file -
+                # or one that arrived after this container started - must not
+                # advertise images the server would refuse.
+                image_input = bool(self.serves_images)
+            else:
+                image_input = bool(supports.get("image_input", False)) or (
+                    detect and self.has_mmproj)
         return {"tools": bool(ov.get("tools", supports.get("tools", False))),
                 "reasoning": bool(reasoning),
                 "image_input": bool(image_input)}
@@ -400,6 +433,8 @@ class ModelEntry:
                 "path": str(self.path),
                 "size_gb": round(self.size / 1e9, 2),
                 "architecture": self.arch,
+                "projector": str(find_vision_projector(self.path) or ""),
+                "vision_served": self.serves_images,
             },
         }
         if ctx > 0:
@@ -592,13 +627,25 @@ class Engine:
 
     def probe(self, port: int) -> str:
         """Return the model id served on <port>, or "" when it is not ready."""
+        served, _ = self.probe_full(port)
+        return served
+
+    def probe_full(self, port: int) -> tuple[str, bool | None]:
+        """Served id and whether that server takes images (None: unknown)."""
         try:
             data = http_json(f"http://127.0.0.1:{port}/v1/models", timeout=5,
                              bearer=str(self.cfg.get("container_api_key") or ""))
         except Exception:  # noqa: BLE001
-            return ""
+            return "", None
         items = data.get("data") or []
-        return str(items[0].get("id")) if items else ""
+        if not items:
+            return "", None
+        first = items[0] if isinstance(items[0], dict) else {}
+        mods = ((first.get("architecture") or {}).get("input_modalities"))
+        images = None
+        if isinstance(mods, list):
+            images = any(str(m).lower() == "image" for m in mods)
+        return str(first.get("id") or ""), images
 
     def adopt_running(self) -> None:
         """Adopt containers that are already up (bridge restart, `gufo run` by hand)."""
@@ -609,10 +656,11 @@ class Engine:
         for entry in self.catalog.entries:
             if entry.container in names:
                 port = self.container_port(entry.container)
-                served = self.probe(port) if port else ""
+                served, images = self.probe_full(port) if port else ("", None)
                 if served:
                     entry.running = True
                     entry.port = port
+                    entry.serves_images = images
                     entry.served_id = served
                     log(f"adopted running container {entry.container} on :{port} ({served})")
 
@@ -711,8 +759,9 @@ class Engine:
                     proc = run(retry_required + retry_optional, timeout=None)
                 if proc.returncode == 0:
                     self.errors.pop(entry.id, None)
-                    served = self.probe(port)
+                    served, images = self.probe_full(port)
                     entry.running, entry.port, entry.served_id = True, port, served
+                    entry.serves_images = images
                     entry.last_used = time.time()
                     self.enforce_limits(exclude=entry.id)
                     log(f"ready: {entry.id} on http://127.0.0.1:{port}/v1 ({served})")

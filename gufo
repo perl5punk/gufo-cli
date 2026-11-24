@@ -65,7 +65,7 @@ resolve_model() {
       lb_n="${lb_n//_/-}"
       # draft sidecars and vision projectors are never serve targets (an MTP
       # "shared" sidecar e.g. has no token-embedding table at all)
-      case "$lb_n" in mtp-*|*dflash*|*dspark*|mmproj*) continue ;; esac
+      is_sidecar_name "$lb" && continue
       if [ "$lb_n" = "${base//_/-}" ] || [[ "$lb_n" == *"${ql//_/-}"* ]]; then
         printf '%s\n' "$f"
         return 0
@@ -75,8 +75,8 @@ resolve_model() {
   for d in "${GUFO_MODELS_DIRS[@]}"; do
     [ -d "$d" ] || continue
     hit=$(find "$d" -maxdepth 4 -iname '*.gguf' \
-            ! \( -iname 'mtp-*' -o -iname '*dflash*' -o -iname '*dspark*' -o -iname 'mmproj*' \) \
-            -ipath "*$query*" 2>/dev/null | sort | head -1)
+            ! \( -iname 'mtp-*' -o -iname '*dflash*' -o -iname '*dspark*' -o -iname '*mmproj*' \) \
+            -ipath "*$query*" 2>/dev/null | sort | head -1)   # keep in sync: is_sidecar_name
     if [ -n "$hit" ]; then
       printf '%s\n' "$hit"
       return 0
@@ -198,6 +198,30 @@ is_reasoning_arch() { # <architecture> -> 0 when the family thinks
   return 1
 }
 
+# Draft and projector files are inputs to a model, never serve targets: an MTP
+# "shared" sidecar has no token-embedding table, a vision projector no language
+# weights at all. One predicate so `models`, resolution and the bridge agree.
+is_sidecar_name() { # <path> -> 0 when the file is a draft or a projector
+  local n="${1,,}"; n="${n//_/-}"
+  case "$n" in mtp-*|*dflash*|*dspark*|*mmproj*) return 0 ;; esac
+  return 1
+}
+
+# The engine auto-discovers a vision sidecar named exactly this, beside the
+# model, and refuses image input otherwise ("image input requires a matching
+# --mmproj BF16 sidecar"). Anything else has to be passed with --mmproj.
+GUFO_MMPROJ_NAME="${GUFO_MMPROJ_NAME:-mmproj-BF16.gguf}"
+
+# The projector to use for a model, if any: the conventional name wins, then any
+# *mmproj*.gguf nearby (which only works because we pass it explicitly).
+find_vision_projector() { # <model path> -> projector path or empty
+  local dir parent
+  dir=$(dirname "$1")
+  [ -f "$dir/$GUFO_MMPROJ_NAME" ] && { printf '%s\n' "$dir/$GUFO_MMPROJ_NAME"; return 0; }
+  find "$dir" -maxdepth 2 -iname "$GUFO_MMPROJ_NAME" 2>/dev/null | head -1
+  find_sidecar "$dir" "$1" '*mmproj*.gguf' 2>/dev/null | head -1
+}
+
 # Capability guess from file names, used when GGUF metadata is unavailable.
 name_suggests_reasoning() { # <model path or name>
   local n="${1,,}"
@@ -225,10 +249,15 @@ detect_reasoning() { # <model path> <mode>
   fi
 }
 
-# Vision needs a projector sidecar, which the engine auto-discovers beside the
-# model; a running container is the authority once it is up.
-detect_vision() { # <model path> <mode> [port]
-  local mode="$2" port="${3:-}" mods
+# Vision is a property of the *served* model: the engine validates that the
+# projector matches the checkpoint and rejects an image request otherwise. So a
+# running container is the authority; a projector we are about to pass is the
+# next best thing. A leftover or mismatched sidecar never advertises vision.
+# Returns on|off|unknown. "unknown" means the container that serves this model
+# did not answer - a busy engine is not evidence either way, and guessing from
+# files there would advertise image input the server then refuses.
+detect_vision() { # <model path> <mode auto|on|off> [port] [projector we attached]
+  local mode="$2" port="${3:-}" projector="${4:-}" mods
   case "$mode" in
     on)  printf 'on';  return 0 ;;
     off) printf 'off'; return 0 ;;
@@ -236,10 +265,16 @@ detect_vision() { # <model path> <mode> [port]
   if [ -n "$port" ]; then
     mods=$(curl -fsS --max-time 5 "http://127.0.0.1:$port/v1/models" 2>/dev/null \
              | jq -r '.data[0].architecture.input_modalities[]?' 2>/dev/null | tr '\n' ' ')
+    if [ -z "$mods" ]; then
+      # No answer (or an engine that reports no modalities): only a projector we
+      # attached ourselves justifies claiming vision.
+      [ -n "$projector" ] && printf 'on' || printf 'unknown'
+      return 0
+    fi
     case "${mods,,}" in *image*) printf 'on'; return 0 ;; esac
-    [ -n "$mods" ] && { printf 'off'; return 0; }
+    printf 'off'; return 0
   fi
-  find_sidecar "$(dirname "$1")" "$1" '*mmproj*.gguf' >/dev/null 2>&1 && printf 'on' || printf 'off'
+  [ -n "$projector" ] && printf 'on' || printf 'off'
 }
 
 # Host path of the GGUF a container serves (from its mount + serve args).
@@ -457,16 +492,29 @@ wait_ready() { # <name> <port>
 
 # --------------------------------------------------------------- commands ----
 cmd_models() {
-  local found=0 d f
+  local show_all=0 found=0 d f sidecars=0
+  [ "${1:-}" = "--all" ] && show_all=1
   for d in "${GUFO_MODELS_DIRS[@]}"; do
     [ -d "$d" ] || continue
     while IFS= read -r f; do
+      if is_sidecar_name "$f"; then
+        # Draft/projector files belong to a model; list them only on request.
+        if [ "$show_all" = 1 ]; then
+          printf '%-58s %8s  %s  [sidecar]\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)" "$f"
+        else
+          sidecars=$((sidecars + 1))
+        fi
+        continue
+      fi
       found=1
       printf '%-58s %8s  %s\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)" "$f"
     done < <(find "$d" -maxdepth 4 -iname '*.gguf' 2>/dev/null | sort)
   done
   if [ "$found" != 1 ]; then
-    warn "no .gguf files found in: ${GUFO_MODELS_DIRS[*]}"
+    warn "no .gguf models found in: ${GUFO_MODELS_DIRS[*]}"
+  elif [ "$sidecars" -gt 0 ]; then
+    info ""
+    info "$sidecars sidecar file(s) hidden (drafts, vision projectors) - see: gufo models --all"
   fi
 }
 
@@ -535,6 +583,7 @@ cmd_run() {
   local spec_mode=auto spec_path="" draft_tokens="" draft_policy=""
   local served_name="" api_key=""
   local sessions=$GUFO_SESSIONS_DEFAULT reasoning_mode=auto vision_mode=auto
+  local mmproj_mode=auto
   local tailscale=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -553,6 +602,7 @@ cmd_run() {
       --sessions|-j) sessions="${2:-}"; shift 2 ;;
       --reasoning)   reasoning_mode="${2:-}"; shift 2 ;;
       --vision)      vision_mode="${2:-}"; shift 2 ;;
+      --mmproj)      mmproj_mode="${2:-}"; shift 2 ;;
       --no-register) register=0; shift ;;
       --skip-device-check) skip_devcheck=1; shift ;;
       --tailscale)   tailscale=1; shift ;;
@@ -579,6 +629,9 @@ cmd_run() {
   fi
   if [[ ! "$vision_mode" =~ ^(auto|on|off)$ ]]; then
     die "invalid --vision '$vision_mode' (expected auto, on or off)"
+  fi
+  if [[ ! "$mmproj_mode" =~ ^(auto|off)$ ]] && [ ! -f "$mmproj_mode" ]; then
+    die "--mmproj expects auto, off, or a projector file (got '$mmproj_mode')"
   fi
   command -v podman >/dev/null || die "podman not found in PATH"
   if [ "$tailscale" = 1 ]; then
@@ -681,7 +734,28 @@ cmd_run() {
     SERVE_IDENTITY_ARGS+=(--served-model-name "$served_name")
   fi
   if [ -n "$api_key" ]; then
-    SERVE_IDENTITY_ARGS+=(--api-key "$api_key")
+    SERVE_IDENTITY_ARGS+=(--api-key "$api-key")
+  fi
+
+  # Vision projector. The engine auto-discovers exactly $GUFO_MMPROJ_NAME beside
+  # the model and refuses image input otherwise, and it validates that the
+  # projector belongs to this checkpoint. Passing the path we resolved removes
+  # the guesswork (any name works); --mmproj off stops us wiring one in, though
+  # the engine may still auto-load the conventional file if it sits there.
+  local vision_path=""
+  case "$mmproj_mode" in
+    auto) vision_path=$(find_vision_projector "$path" || true) ;;
+    off)  vision_path="" ;;
+    *)    vision_path="$mmproj_mode" ;;
+  esac
+  local VISION_ARGS=()
+  if [ -n "$vision_path" ]; then
+    case "$vision_path" in
+      "$root"/*) : ;;
+      *) die "vision projector must live under the mounted models root '$root': $vision_path" ;;
+    esac
+    VISION_ARGS+=(--mmproj "$(container_path_for "$vision_path" "$root")")
+    info "  vision: $vision_path"
   fi
 
   gpu_flags
@@ -692,18 +766,36 @@ cmd_run() {
   info "  port:   127.0.0.1:$port"
   info "  runs:   $sessions parallel session(s)"
   [ -n "$served_name" ] && info "  id:     $served_name (served model name)"
-  if ! podman run -d --name "$name" \
-    "${GPU_FLAGS[@]}" \
-    -v "${root}:/models:ro,z" \
-    -p 127.0.0.1:${port}:${port} \
-    "$image" \
-    gufo serve llm --model "$cpath" --host 0.0.0.0 --port "$port" \
-      -c "$ctx" --sessions "$sessions" --cache-ram-bytes "$ram_cache" \
-      "${SPEC_ARGS[@]}" "${SERVE_IDENTITY_ARGS[@]}" >/dev/null; then
-    die "podman run failed"
-  fi
+  # A projector must never cost the model its service, so keep the launch
+  # repeatable without it (the engine validates that a sidecar belongs to the
+  # checkpoint and can refuse to load one that does not).
+  launch_container() {
+    podman run -d --name "$name" \
+      "${GPU_FLAGS[@]}" \
+      -v "${root}:/models:ro,z" \
+      -p 127.0.0.1:${port}:${port} \
+      "$image" \
+      gufo serve llm --model "$cpath" --host 0.0.0.0 --port "$port" \
+        -c "$ctx" --sessions "$sessions" --cache-ram-bytes "$ram_cache" \
+        "${SPEC_ARGS[@]}" "${VISION_ARGS[@]}" "${SERVE_IDENTITY_ARGS[@]}" >/dev/null
+  }
 
-  wait_ready "$name" "$port" || die "model failed to load (container left running: gufo logs $name)"
+  launch_container || die "podman run failed"
+
+  if ! wait_ready "$name" "$port"; then
+    if [ "${#VISION_ARGS[@]}" -gt 0 ] &&
+       podman logs "$name" 2>&1 | grep -qiE 'mmproj|vision sidecar|image input'; then
+      warn "the engine rejected the vision projector ($(basename "$vision_path")); restarting text-only"
+      podman rm -f "$name" >/dev/null 2>&1 || true
+      VISION_ARGS=()
+      vision_path=""
+      launch_container || die "podman run failed (text-only retry)"
+      wait_ready "$name" "$port" ||
+        die "model failed to load (container left running: gufo logs $name)"
+    else
+      die "model failed to load (container left running: gufo logs $name)"
+    fi
+  fi
 
   local id
   id=$(served_model_id "$port") || true
@@ -714,7 +806,8 @@ cmd_run() {
 
   local reasoning vision
   reasoning=$(detect_reasoning "$path" "$reasoning_mode")
-  vision=$(detect_vision "$path" "$vision_mode" "$port")
+  vision=$(detect_vision "$path" "$vision_mode" "$port" "$vision_path")
+  [ "$vision" = "unknown" ] && vision=$([ -n "$vision_path" ] && echo on || echo off)
 
   if [ "$register" = 1 ]; then
     local prov display
@@ -911,14 +1004,23 @@ cmd_refresh() {
   # attachments follow the model instead of whatever was written at first run.
   local path reasoning vision caps cur
   path=$(container_model_path "$n")
+  # Keep whatever is registered when we cannot know better: a GGUF we cannot
+  # read, or an engine too busy to answer, must not rewrite capabilities -
+  # guessing "on" here would let pi attach images the server refuses.
+  local keep_reasoning keep_vision
+  keep_reasoning=$([ "$(jq -r --arg p "$n" '.providers[$p].models[0].reasoning // false' "$PI_MODELS_JSON")" = true ] && echo on || echo off)
+  keep_vision=$([ "$(jq -r --arg p "$n" '(.providers[$p].models[0].input // ["text"]) | index("image") != null' "$PI_MODELS_JSON")" = true ] && echo on || echo off)
+
   if [ -n "$path" ] && [ -f "$path" ]; then
     reasoning=$(detect_reasoning "$path" auto)
     vision=$(detect_vision "$path" auto "$port")
   else
-    # Cannot see the GGUF (moved, or another host serves it): keep the entry's
-    # current capabilities rather than guessing them away.
-    reasoning=$([ "$(jq -r --arg p "$n" '.providers[$p].models[0].reasoning // false' "$PI_MODELS_JSON")" = true ] && echo on || echo off)
-    vision=$([ "$(jq -r --arg p "$n" '(.providers[$p].models[0].input // ["text"]) | index("image") != null' "$PI_MODELS_JSON")" = true ] && echo on || echo off)
+    reasoning="$keep_reasoning"
+    vision="$keep_vision"
+  fi
+  if [ "$vision" = "unknown" ]; then
+    vision="$keep_vision"
+    warn "$n: server did not report modalities; keeping input as-is ('$vision')"
   fi
   caps=$(capabilities_json "$reasoning" "$vision")
 
@@ -1057,7 +1159,8 @@ gufo — manage GGUF models via Gufo containers, hooked into pi-webui
 
 usage: gufo <command> [args]
 
-  models                          list available .gguf files
+  models [--all]                  list serve-able .gguf files (--all: also drafts
+                                  and vision projectors, which are never models)
   gpu                             check GPU device nodes + container access (run after
                                   driver installs, OS upgrades, or on any load error)
   run <model> [opts]              start model + register in pi models.json
@@ -1082,7 +1185,13 @@ usage: gufo <command> [args]
       --reasoning MODE            advertise a thinking channel to pi: auto (default: from
                                   GGUF architecture / file name), on or off
       --vision MODE               advertise image input: auto (default: from the running
-                                  model, else an *mmproj*.gguf beside it), on or off
+                                  model, else the projector wired in below), on or off
+      --mmproj PATH|auto|off      vision projector for this model (default: auto:
+                                  $GUFO_MMPROJ_NAME beside the model, else any
+                                  *mmproj*.gguf nearby). The engine only auto-discovers
+                                  the conventional name and checks the projector belongs
+                                  to the checkpoint, so a stale sidecar never enables
+                                  vision on its own
       --no-register               container only, skip models.json
       --skip-device-check         don't verify container GPU device access before start
       --tailscale                 expose endpoint on the tailnet via 'tailscale serve'

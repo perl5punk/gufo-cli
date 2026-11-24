@@ -178,7 +178,7 @@ noted (a restart is always safe: `systemctl --user restart gufo-lemonade`).
 | `ram_cache_bytes` | `4294967296` | passed to `gufo run --ram-cache` |
 | `speculative` | `auto` | `auto`/`off`/`mtp`/`dflash2`/`dspark` |
 | `sessions` | `1` | Parallel runs per model (`gufo serve --sessions`): requests share the engine instead of queueing, each a bit slower. Every session reserves its own `ctx`, so set this per model, not globally (`0` omits the flag) |
-| `detect_capabilities` | `true` | Refine `supports` per model: reasoning only for thinking architectures (qwen3/qwen35/qwen4exp/…), image input when an `*mmproj*.gguf` sits beside the model |
+| `detect_capabilities` | `true` | Refine `supports` per model: reasoning only for thinking architectures (qwen3/qwen35/qwen4exp/…), image input from the loaded container when one is running, else from a projector beside the model |
 | `use_served_names` | `true` | serve each container under the published id (`gufo run --served-name`), not the GGUF's internal name |
 | `container_api_key` | `""` | optional bearer key required *inside* containers |
 | `api_key` | `gufo-local` | required bearer key on the bridge (except `/health`); Gufo never sees it |
@@ -218,10 +218,18 @@ can carry four; a 111 GB model at 262k cannot carry two.
 Model **capabilities** are published per model, so Lemonade labels models
 `tool-calling` / `reasoning` correctly and the app hides image input for text-only
 checkpoints: `supports_reasoning` follows the checkpoint architecture, and
-`supports_image_input` turns on when a vision projector (`*mmproj*.gguf`) sits
-beside the model — the same rules the `gufo` CLI writes into pi's `models.json`,
-so both apps describe a model identically. `detect_capabilities: false` falls back
-to the flat `supports` block; `model_overrides` always wins.
+`supports_image_input` comes from the **loaded container** when that model is
+running — the engine validates that a projector belongs to the checkpoint, so a
+file on disk is only a hint until a container says `input_modalities` includes
+`image`. When nothing is loaded yet it falls back to the presence of a projector
+(`mmproj-BF16.gguf`, or any `*mmproj*.gguf`) beside the model, which is what
+`gufo run` will attach when it starts. Either way `/v1/models` carries the proof
+in `gufo.projector` and `gufo.vision_served`.
+
+Consequence worth knowing: dropping a projector next to an already-running model
+changes nothing until that container restarts — until then pi and Lemonade keep
+it text-only, correctly. `detect_capabilities: false` falls back to the flat
+`supports` block; `model_overrides` always wins.
 
 Model ids come from the file name (`Qwen3.8-27B-UD-Q8_K_XL.gguf` →
 `gufo.Qwen3.8-27B-UD-Q8_K_XL`), stable across restarts. Sharded sets
@@ -294,10 +302,11 @@ Fedora 44, Lemonade Server 11.9.0 (RPM, `lemond.service` as user `lemonade`,
   message verbatim and Lemonade shows it. Check `gufo diagnose` and the runtime
   release notes for the supported set, and keep unsupported GGUFs out of the
   published catalog with `model_overrides: {"<id>": {"hidden": true}}`.
-- **Image input is off by default.** Gufo can attach a `--mmproj` sidecar, but
-  `gufo run` does not wire it up yet, so the bridge advertises text-only
-  models (`supports.image_input`) unless you override a model — do not enable it
-  until the sidecar is actually attached.
+- **Vision depends on a projector the engine accepts.** `gufo run` attaches
+  `mmproj-BF16.gguf` (or any `*mmproj*.gguf`) automatically, but the engine
+  validates the pairing and loads text-only if it disagrees — so image input is
+  advertised from the loaded container, not from the file. A model whose
+  projector arrived after it started stays text-only until restarted.
 - The bridge does not touch `~/.pi/agent/models.json`: it always calls
   `gufo run --no-register`, so pi and Lemonade never fight over registrations.
   pi can consume the same models through Lemonade (`local-lemonade` on

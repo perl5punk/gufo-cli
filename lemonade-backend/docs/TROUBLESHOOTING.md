@@ -188,6 +188,30 @@ curl -N localhost:13399/v1/chat/completions -H "Authorization: Bearer ..." -d '.
 curl -N localhost:13305/v1/chat/completions -d '{"model":"gufo. ...","stream":true}' # lemonade
 ```
 
+## Images are rejected, or a model with a projector is still text-only
+
+Image input needs a projector the engine accepts, and it is a property of the
+**loaded** model — so these three states look similar but differ:
+
+| Symptom | What is happening | Fix |
+|---|---|---|
+| `image input requires the model's matching mmproj` | the container was started without a projector (none present at load time, or `--mmproj off`) | put `mmproj-BF16.gguf` beside the model (or `gufo run <model> --mmproj path/to/proj.gguf`) and restart the model |
+| `vision sidecar does not match the … model` | the projector belongs to a different checkpoint; the engine refuses it | get the projector published with that model; do not force it — the bridge reports text-only, correctly |
+| projector present, model loaded before it arrived | the running server is still text-only | restart the model; `gufo refresh` afterwards |
+
+Check which state you are in without guessing:
+
+```bash
+curl -s localhost:13400/v1/models | jq '.data[0].architecture.input_modalities'
+# or, through the bridge (authoritative for loaded models, and shows the hint):
+curl -s -H "Authorization: Bearer $(jq -r .api_key ~/.config/gufo-lemonade/config.json)" \
+  localhost:13399/v1/models | jq '.data[] | {id, image: .supports_image_input, v: .gufo.vision_served}'
+```
+
+`vision_served: false` with a projector on disk means exactly the third row. If
+the engine rejects a projector during startup, `gufo run` says so and restarts
+without it, so the model still serves text.
+
 ## Memory: models keep getting evicted (or the box thrashes)
 
 `max_loaded` is the knob: `1` (default) evicts the LRU container **before**

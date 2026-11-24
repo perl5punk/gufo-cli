@@ -36,9 +36,10 @@ Starting gufo-qwen3-8-27b-ud-q8
   (OpenAI completions API) in `~/.pi/agent/models.json` with a `.bak` backup on
   every change; unregisters on `stop`. The entry carries the model's
   **capabilities** — `reasoning: true` for thinking families (Qwen3/Qwen3.5/
-  Flash-Next, …) so `/thinking` appears, and `input: ["text","image"]` when a
-  vision projector sits beside the model so images can be attached.
-  `gufo refresh` re-reads them for a running model.
+  Flash-Next, …) so `/thinking` appears, and `input: ["text","image"]` when the
+  model really takes images, which the loaded server reports rather than the
+  file list ([Vision input](#vision-input)). `gufo refresh` re-reads them for a
+  running model.
 - **Parallel runs, when you can afford them** — `--sessions N` maps to the
   engine's preallocated GPU request sessions. Requests then share the engine
   instead of queueing (each a bit slower), which is worth it for small and
@@ -127,7 +128,8 @@ gufo run qwen3.8-27b-ud-q4 --name gufo-27b-q4 --port 13310
 | `--draft-policy POLICY` | engine default | DFlash2 block policy: `fixed` or `adaptive` |
 | `--sessions N` (`-j`) | 1 (engine default) | Parallel runs per model. Each session reserves its **own** `--ctx` worth of KV, so raise it only when the memory is there for N contexts |
 | `--reasoning MODE` | `auto` | Advertise a thinking channel to pi: `auto` (from GGUF architecture, else file name), `on`, `off` |
-| `--vision MODE` | `auto` | Advertise image input: `auto` (from the running model, else an `*mmproj*.gguf` beside it), `on`, `off` |
+| `--vision MODE` | `auto` | Advertise image input: `auto` (from the running model, else the projector below), `on`, `off` |
+| `--mmproj PATH` | `auto` | Vision projector to attach: `auto` = `mmproj-BF16.gguf` beside the model, else any `*mmproj*.gguf` nearby; `off` = don't attach one |
 | `--served-name ID` | GGUF `general.name` | Model id exposed by the OpenAI API (use a stable id when another app lists models and forwards requests back to you) |
 | `--api-key KEY` | none | Require this bearer key in the container |
 | `--image IMG` | `ghcr.io/gufo-org/toolboxes/gufo-runtime:latest` | Runtime image |
@@ -226,6 +228,37 @@ Measured on a Strix Halo (Strix Point X1), Qwen3.8-27B:
 
 The container's load log confirms the backend:
 `podman logs <name> | grep -o 'speculative=[a-z0-9]*'`.
+
+## Vision input
+
+Image input needs a **projector** — a small BF16 GGUF (`clip.*` vision tower, no
+language weights) that the engine encodes images with. Rules that matter:
+
+- The engine auto-discovers a sidecar named exactly **`mmproj-BF16.gguf`** beside
+  the model, and nothing else. `gufo run` resolves the projector itself and
+  passes `--mmproj` explicitly, so a differently named file works too.
+- The engine **validates the projector against the checkpoint** ("vision sidecar
+  does not match the … model", "image input requires the model's matching
+  mmproj"), and refuses image requests without one. So a projector sitting in a
+  directory does not make a model visual.
+- If the engine rejects the projector at load time, `gufo run` notices in the
+  container log and restarts **without** it, so a bad sidecar costs you vision,
+  not the model.
+
+Because of the second bullet, capabilities are reported from the **running**
+model, not from what files exist:
+
+```bash
+$ gufo run flash-next            # attaches mmproj-BF16.gguf, registers input: [text, image]
+$ gufo status
+    model: Qwen3.8 Flash Next
+    registered in models.json: yes (reasoning=true input=text+image)
+```
+
+Drop a projector in *after* the model is already loaded and nothing changes until
+the container restarts — the loaded server is still text-only, and pi keeps
+refusing images accordingly (run `gufo refresh` to see the current truth).
+`gufo models` never lists projectors as models.
 
 ## Downloading a model (`download`)
 

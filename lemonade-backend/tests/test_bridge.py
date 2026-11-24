@@ -428,5 +428,69 @@ class TestLaunchCommand(unittest.TestCase):
             self.assertNotIn("--sessions", required)      # retry path drops optional
 
 
+class TestVisionProjector(unittest.TestCase):
+    """Image input is what the served model does, not what a file suggests."""
+
+    CFG = json.loads(json.dumps(gl.DEFAULTS))
+
+    def model(self, tmp: str, name: str = "Big.gguf"):
+        path = Path(tmp) / name
+        path.write_bytes(b"GGUF")
+        return gl.ModelEntry(name.rsplit(".", 1)[0], name, path, 1000,
+                             {"general.architecture": "qwen4exp"})
+
+    def test_conventional_name_is_preferred(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = self.model(tmp)
+            other = Path(tmp) / "Qwen-vision-mmproj-Q8_0.gguf"
+            other.write_bytes(b"GGUF")
+            exact = Path(tmp) / gl.MMPROJ_NAME
+            exact.write_bytes(b"GGUF")
+            self.assertEqual(exact, gl.find_vision_projector(model.path))
+            exact.unlink()
+            self.assertEqual(other, gl.find_vision_projector(model.path))
+
+    def test_projector_name_is_matched_case_insensitively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = self.model(tmp)
+            odd = Path(tmp) / "Mmproj-BF16.GGUF"
+            odd.write_bytes(b"GGUF")
+            self.assertEqual(odd, gl.find_vision_projector(model.path))
+
+    def test_model_without_a_projector_is_text_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = self.model(tmp)
+            self.assertIsNone(gl.find_vision_projector(model.path))
+            self.assertFalse(model.capabilities(self.CFG)["image_input"])
+
+    def test_running_server_outvotes_the_file(self):
+        # The projector arrived after the container started, or does not match
+        # the checkpoint: the engine refuses images, so we must too.
+        with tempfile.TemporaryDirectory() as tmp:
+            model = self.model(tmp)
+            (Path(tmp) / gl.MMPROJ_NAME).write_bytes(b"GGUF")
+            model.running = True
+            model.serves_images = False
+            self.assertFalse(model.capabilities(self.CFG)["image_input"])
+
+    def test_running_server_can_enable_vision_without_our_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = self.model(tmp)
+            model.running = True
+            model.serves_images = True
+            self.assertTrue(model.capabilities(self.CFG)["image_input"])
+
+    def test_explicit_override_wins_over_the_server(self):
+        # An override is a statement of intent ("this model takes images"), so
+        # it survives even a container that started without a projector.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = json.loads(json.dumps(self.CFG))
+            model = self.model(tmp, "Big.gguf")
+            cfg["model_overrides"] = {model.id: {"image_input": True}}
+            model.running = True
+            model.serves_images = False
+            self.assertTrue(model.capabilities(cfg)["image_input"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
