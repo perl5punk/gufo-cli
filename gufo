@@ -1119,6 +1119,15 @@ cmd_download() {
       info "downloading MTP sidecar (2.8 GB)"
       hf download "$hf_repo" --revision "$hf_rev" \
         "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" --local-dir "$dest"
+      # Vision projector (0.9 GB). The --include pattern above only covers the quant
+      # dir and the repo keeps the projector at its root, while find_vision_projector()
+      # looks beside the shards - so fetch it by name into UD-Q4_K_XL/, under the
+      # default $GUFO_MMPROJ_NAME and the same pinned revision. Without it the model
+      # serves text perfectly and refuses every image with 400 "model does not support
+      # image input", which reads like a pi bug rather than a missing file.
+      info "downloading vision projector $GUFO_MMPROJ_NAME (0.9 GB) beside the shards"
+      hf download "$hf_repo" --revision "$hf_rev" \
+        "$GUFO_MMPROJ_NAME" --local-dir "$dest/UD-Q4_K_XL"
       expect=(
         "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf:10946624"
         "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf:49859583136"
@@ -1126,6 +1135,15 @@ cmd_download() {
         "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf:12087983520"
         "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf:2786568256"
       )
+      # Verified only for the projector sizes we know; a renamed sidecar
+      # (GUFO_MMPROJ_NAME pointing elsewhere) still downloads, unchecked.
+      local mmproj_bytes=""
+      case "$GUFO_MMPROJ_NAME" in
+        mmproj-BF16.gguf) mmproj_bytes=907542944 ;;
+        mmproj-F16.gguf)  mmproj_bytes=904004000 ;;
+      esac
+      [ -n "$mmproj_bytes" ] &&
+        expect+=("UD-Q4_K_XL/$GUFO_MMPROJ_NAME:$mmproj_bytes")
       ;;
     dflash2-27b)
       info "downloading $hf_repo draft (1.1 GB)"
@@ -1148,7 +1166,7 @@ cmd_download() {
   (( fail == 0 )) || die "size verification failed under $dest"
 
   case "$recipe" in
-    flash-next)  ok "ready: gufo run flash-next --ctx 32768  (stop other models first: 114 GB weights)" ;;
+    flash-next)  ok "ready: gufo run flash-next --ctx 32768  (stop other models first: 115 GB weights; it attaches the projector and registers input: [text, image])" ;;
     dflash2-27b) ok "ready: gufo run 27b  will now auto-enable DFlash2" ;;
   esac
 }

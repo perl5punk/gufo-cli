@@ -255,6 +255,9 @@ $ gufo status
     registered in models.json: yes (reasoning=true input=text+image)
 ```
 
+`gufo download flash-next` fetches the checkpoint-matched projector with the
+shards, so a fresh install gets image input on its first `gufo run`.
+
 Drop a projector in *after* the model is already loaded and nothing changes until
 the container restarts — the loaded server is still text-only, and pi keeps
 refusing images accordingly (run `gufo refresh` to see the current truth).
@@ -267,7 +270,7 @@ fetches a known-good model plus its speculative sidecar, verifies every file
 byte-for-byte, and lands them where `run --speculative auto` will find them:
 
 ```sh
-gufo download flash-next    # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP sidecar (~114 GB)
+gufo download flash-next    # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP sidecar + projector (~115 GB)
 gufo download dflash2-27b   # DFlash2 draft next to the 27B GGUF (~1.1 GB)
 ```
 
@@ -276,9 +279,13 @@ before starting, and is resumable — rerun it if a transfer drops. It needs the
 [`hf` CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)
 (installed and `hf auth login`).
 
-- **`flash-next`** writes shards to `<models-dir>/qwen3.8-flash-next/UD-Q4_K_XL/`
-  and the MTP sidecar to `…/MTP/mtp-*.gguf`; `gufo run flash-next --ctx 32768`
-  then auto-enables MTP.
+- **`flash-next`** writes shards to `<models-dir>/qwen3.8-flash-next/UD-Q4_K_XL/`,
+  the MTP sidecar to `…/MTP/mtp-*.gguf`, and `mmproj-BF16.gguf` back into
+  `UD-Q4_K_XL/` where the projector lookup looks (not the repo root, where
+  Hugging Face keeps it); `gufo run flash-next --ctx 32768` then auto-enables MTP
+  and image input, and registers `input: [text, image]`. A Flash-Next install
+  pulled before the projector was part of the recipe runs text-only until the
+  file is added and the container restarts.
 - **`dflash2-27b`** drops `Qwen3.8-27B-DFlash2-Q4_K_M.gguf` beside the 27B target
   in `Qwen3.8-27B-GGUF/`; `gufo run <27b>` then auto-enables DFlash2.
 
