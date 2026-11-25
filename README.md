@@ -46,6 +46,10 @@ Starting gufo-qwen3-8-27b-ud-q8
   medium contexts; `-c` is per session, so two 262k sessions on a 111 GB model
   reserve two full contexts and there isn't room. Default stays at the engine's
   own `1`.
+- **Remembers where files came from** — `download` records the repo and commit it
+  fetched, so `gufo updates` can tell you a model is stale and upgrade it in
+  place, and `gufo run` says so before it starts
+  ([Staying current](#staying-current-updates)).
 - **Observability** — `status`, `logs`, and `diagnose` subcommands; the
   container logs report per-request `decode_tps`, `prefill_tps`, TTFT and
   draft acceptance (see [Watching tokens/sec](#watching-tokenssec)).
@@ -291,6 +295,46 @@ before starting, and is resumable — rerun it if a transfer drops. It needs the
 
 Both land in the first entry of `GUFO_MODELS_DIRS` (`~/models` by default), so
 they show up in `gufo models` immediately.
+
+`download` also writes `.gufo-source.json` next to the files — repo, commit, and
+the byte size of every file it fetched — which is what makes
+[updates](#staying-current-updates) possible.
+
+## Staying current (`updates`)
+
+A GGUF on disk carries no note about which Hub commit it came from, so gufo keeps
+that note itself. `gufo updates` compares it against the Hub; `gufo run` prints
+the same answer as a one-line notice before starting a model:
+
+```console
+$ gufo run flash-next
+update available for 'flash-next': the Hub is at f5d175de2c, this copy at the recorded commit.
+   1 tracked file(s) changed size.
+upgrade with: gufo updates flash-next --apply (or: gufo updates flash-next to see it first)
+Starting gufo-qwen3-8-flash-next-ud-q4-k-xl
+```
+
+```sh
+gufo updates --all              # every recipe this machine downloaded
+gufo updates flash-next         # one recipe (a model or a path works too)
+gufo updates flash-next --apply # fetch the newer commit, then re-record what we hold
+```
+
+What it checks is the **tracked file list**, not the whole repo: the recipe's own
+model, its draft sidecar and its projector. Two details worth knowing:
+
+- The upgrade fetches the current commit, which is how you move *past* a recipe's
+  pinned revision. That is deliberate: the pin is the known-good download, and
+  `updates` is the explicit step off it.
+- A file the newer commit no longer carries cannot be fetched from it, so it is
+  named, left alone on disk, and dropped from tracking rather than failing the
+  upgrade.
+
+The check is deliberately weak-failure everywhere except `gufo updates` itself:
+cached in the record (`GUFO_UPDATE_TTL`, default 24 h; a failed lookup retries
+after 5 min), a 4 s budget on a start versus 10 s when you asked for it, and
+silent when offline or when a model was copied in by hand. `GUFO_UPDATE_CHECK=0`
+turns it off, `GUFO_HUB` points it at a mirror.
 
 ## Exposing an endpoint on your tailnet
 

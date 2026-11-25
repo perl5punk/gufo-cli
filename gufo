@@ -35,9 +35,18 @@ WAIT_TIMEOUT=900                                  # max seconds to wait for mode
 CONTAINER_PREFIX="gufo-"
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_rst=$'\033[0m'
+TAB=$'\t'   # readable delimiters for the "dir<TAB>recipe" records between helpers
 info() { printf '%s\n' "$*" >&2; }
 ok()   { printf '%s\n' "${c_grn}$*${c_rst}" >&2; }
 warn() { printf '%s\n' "${c_ylw}$*${c_rst}" >&2; }
+# Only ever called where a human can answer; callers check [ -t 0 ] first.
+confirm() { # <prompt> -> 0 on yes
+  local a
+  printf '%s [y/N] ' "$*" >&2
+  read -r a || return 1
+  case "${a,,}" in y|yes) return 0 ;; esac
+  return 1
+}
 die()  { printf '%s\n' "${c_red}error: $*${c_rst}" >&2; exit 1; }
 
 # ------------------------------------------------------------ helpers -------
@@ -662,6 +671,14 @@ cmd_run() {
   fi
   podman rm -f "$name" >/dev/null 2>&1 || true
 
+  # ----------------------------------------------------- hub freshness ----
+  # A missing file on the Hub is no reason to refuse to serve a model, so this
+  # only ever prints: cached, short-timeout, silent on any failure, and off with
+  # GUFO_UPDATE_CHECK=0 for air-gapped or chatty setups.
+  if [ "$GUFO_UPDATE_CHECK" = 1 ]; then
+    update_notice "$path" || true
+  fi
+
   local root cpath
   root=$(mount_root_for "$path")
   cpath=$(container_path_for "$path" "$root")
@@ -1070,6 +1087,247 @@ cmd_diagnose() {
 # the first models dir so `run --speculative auto` discovers the sidecars:
 #   MTP sidecar   -> <model-dir>/MTP/mtp-*.gguf  (Flash-Next)
 #   DFlash2 draft -> next to the 27B target GGUF (Qwen3.8-27B-GGUF/)
+# ------------------------------------------------------- hub provenance ----
+# A local GGUF says nothing about which Hub commit it came from, so 'download'
+# records that next to the files it fetched. 'updates' and the 'run' notice read
+# the record; models you copied in by hand have none and are left alone.
+GUFO_SOURCE_FILE="${GUFO_SOURCE_FILE:-.gufo-source.json}"
+GUFO_HUB="${GUFO_HUB:-https://huggingface.co}"
+# The notice must not become a network round-trip on every model start.
+GUFO_UPDATE_CHECK="${GUFO_UPDATE_CHECK:-1}"
+GUFO_UPDATE_TTL="${GUFO_UPDATE_TTL:-86400}"
+# Seconds to wait for the Hub when nothing is cached. A model start must not stall
+# on a blackholed route, so the run-time notice gets a shorter budget than the
+# explicit 'updates' command.
+GUFO_HUB_TIMEOUT="${GUFO_HUB_TIMEOUT:-8}"
+GUFO_NOTICE_TIMEOUT="${GUFO_NOTICE_TIMEOUT:-4}"
+
+# Record what a recipe fetched, keyed by recipe so two recipes can share a dir.
+record_source() { # <dest> <recipe> <repo> <revision> <relpath:bytes...>
+  local dest="$1" recipe="$2" repo="$3" rev="$4"; shift 4
+  local pair files='[]' tmp
+  for pair in "$@"; do
+    files=$(jq -c --arg p "${pair%:*}" --argjson b "${pair#*:}" \
+            '. + [{path: $p, bytes: $b}]' <<<"$files")
+  done
+  tmp=$(mktemp "$dest/$GUFO_SOURCE_FILE.XXXXXX") || return 1
+  if [ -f "$dest/$GUFO_SOURCE_FILE" ]; then
+    cp "$dest/$GUFO_SOURCE_FILE" "$tmp"
+  else
+    echo '{}' > "$tmp"
+  fi
+  if jq --arg r "$recipe" --arg repo "$repo" --arg rev "$rev" --argjson f "$files" \
+       '.[$r] = {repo: $repo, revision: $rev, files: $f,
+                 checked_at: 0, head: "", head_status: "unknown", changed: 0, missing: 0}' \
+       "$tmp" > "$tmp.out"; then
+    mv "$tmp.out" "$dest/$GUFO_SOURCE_FILE"
+    rm -f "$tmp"
+  else
+    rm -f "$tmp" "$tmp.out"; return 1
+  fi
+}
+
+# Which recipe produced a model file, if any: <dir>\t<recipe>, walking up from the
+# model so a quant subdir finds the record written at the recipe root.
+source_record_for() { # <model path> -> "<dir>\t<recipe>"
+  local p="$1" d rel r i
+  d=$(dirname "$p")
+  for i in 1 2 3 4; do
+    if [ -f "$d/$GUFO_SOURCE_FILE" ]; then
+      rel="${p#"$d"/}"
+      r=$(jq -r --arg p "$rel" 'to_entries[]
+             | select(any(.value.files[]?; .path | endswith($p))) | .key' \
+             "$d/$GUFO_SOURCE_FILE" 2>/dev/null | head -1)
+      if [ -n "$r" ] && [ "$r" != null ]; then
+        printf '%s\t%s\n' "$d" "$r"
+        return 0
+      fi
+    fi
+    [ "$d" = "/" ] && break
+    d=$(dirname "$d")
+  done
+  return 1
+}
+
+# Every file of a repo at a revision, as "path<TAB>bytes"; empty on any failure.
+hub_files() { # <repo> <revision>
+  curl -fsS --max-time 8 "$GUFO_HUB/api/models/$1/revision/$2?blobs=true" 2>/dev/null |
+    jq -r '.siblings[]? | [.rfilename, (.size // 0)] | @tsv' 2>/dev/null
+}
+
+# Stick the answer in the record so repeated runs cost no network. A failed
+# lookup is cached too, for a shorter window: a machine with no route to the Hub
+# must not stall on every model start.
+cache_record() { # <file> <recipe> <status> <head> <changed> <missing>
+  local file="$1" recipe="$2" st="$3" head="$4" ch="${5:-0}" mi="${6:-0}" tmp
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  if jq --arg r "$recipe" --arg st "$st" --arg head "$head" \
+        --argjson ch "$ch" --argjson mi "$mi" --argjson now "$(date +%s)" \
+        '.[$r] += {checked_at: $now, head: $head, head_status: $st, changed: $ch, missing: $mi}' \
+        "$file" > "$tmp"; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"; return 1
+  fi
+}
+
+# One Hub request answers both questions: the current commit, and the size of every
+# file in the repo. Prints "<status>TAB<head>TAB<changed>TAB<missing>", status being
+# current | update | unknown.
+check_record() { # <dir> <recipe> [force] [timeout]
+  local dir="$1" recipe="$2" force="${3:-0}" probe_timeout="${4:-$GUFO_HUB_TIMEOUT}"
+  local file="$dir/$GUFO_SOURCE_FILE"
+  local rec repo rev status head changed missing body ttl age
+  [ -f "$file" ] || return 1
+  rec=$(jq -c --arg r "$recipe" '.[$r] // empty' "$file" 2>/dev/null) || return 1
+  [ -n "$rec" ] && [ "$rec" != "null" ] || return 1
+  repo=$(jq -r '.repo // empty' <<<"$rec")
+  rev=$(jq -r '.revision // empty' <<<"$rec")
+  [ -n "$repo" ] && [ -n "$rev" ] || return 1
+  status=$(jq -r '.head_status // "unknown"' <<<"$rec")
+  head=$(jq -r '.head // ""' <<<"$rec")
+  changed=$(jq -r '.changed // 0' <<<"$rec")
+  missing=$(jq -r '.missing // 0' <<<"$rec")
+
+  # A verified answer is good for a day; a failed one only for five minutes, so a
+  # laptop that briefly had no route still gets told about updates later today.
+  ttl=$GUFO_UPDATE_TTL
+  [ "$status" = "unknown" ] && ttl=300
+  age=$(( $(date +%s) - $(jq -r '.checked_at // 0' <<<"$rec") ))
+  if [ "$force" != 1 ] && (( age < ttl )); then
+    printf '%s\t%s\t%s\t%s\n' "$status" "$head" "$changed" "$missing"
+    return 0
+  fi
+
+  body=$(curl -fsS --max-time "$probe_timeout" "$GUFO_HUB/api/models/$repo?blobs=true" 2>/dev/null | jq -c \
+           '{sha: .sha, sizes: ((.siblings // []) | map({key: .rfilename, value: (.size // 0)}) | from_entries)}' \
+           2>/dev/null) || body=""
+  head=$(jq -r '.sha // empty' <<<"${body:-null}" 2>/dev/null)
+  if [ -z "$head" ]; then
+    cache_record "$file" "$recipe" unknown "" 0 0 || true
+    printf 'unknown\t\t0\t0\n'
+    return 0
+  fi
+  # A file the Hub no longer carries is worth an upgrade prompt as much as a
+  # resized one: the local copy cannot be re-fetched from that commit again.
+  changed=$(jq -n --argjson r "$rec" --argjson s "$(jq -c '.sizes' <<<"$body")" \
+             '[$r.files[]? | select(($s[.path] != null) and ($s[.path] != .bytes))] | length')
+  missing=$(jq -n --argjson r "$rec" --argjson s "$(jq -c '.sizes' <<<"$body")" \
+              '[$r.files[]? | select($s[.path] == null)] | length')
+  if [ "$head" = "$rev" ] && [ "$missing" = "0" ]; then status=current; else status=update; fi
+  cache_record "$file" "$recipe" "$status" "$head" "$changed" "$missing" || true
+  printf '%s\t%s\t%s\t%s\n' "$status" "$head" "$changed" "$missing"
+}
+
+# One line at start time, from the cache when the cache is fresh.
+update_notice() { # <model path>
+  local hit dir recipe line status head changed missing
+  hit=$(source_record_for "$1") || return 0
+  dir="${hit%%$'\t'*}"; recipe="${hit##*$'\t'}"
+  line=$(check_record "$dir" "$recipe" 0 "$GUFO_NOTICE_TIMEOUT") || return 0
+  IFS=$'\t' read -r status head changed missing <<<"$line"
+  [ "$status" = "update" ] || return 0
+  warn "update available for '$recipe': the Hub is at ${head:0:10}, this copy at the recorded commit."
+  [ "${changed:-0}" != 0 ] && info "   $changed tracked file(s) changed size."
+  [ "${missing:-0}" != 0 ] && info "   $missing tracked file(s) are no longer on the Hub."
+  info "upgrade with: gufo updates $recipe --apply (or: gufo updates $recipe to see it first)"
+  return 0
+}
+
+# Compare what 'download' left on disk against the Hub, and upgrade in place.
+# 'updates' without --apply only reports; on a terminal it offers the upgrade.
+cmd_updates() {
+  local apply=0 target="" a want_all=0 d f hit path
+  for a in "$@"; do
+    case "$a" in
+      --apply) apply=1 ;;
+      --all)   want_all=1 ;;
+      -h|--help) die "usage: gufo updates [--all | <model|recipe>] [--apply]" ;;
+      *) target="$a" ;;
+    esac
+  done
+  command -v curl >/dev/null || die "needs curl"
+  command -v jq >/dev/null || die "needs jq"
+
+  local -a pairs=()
+  if [ "$want_all" = 1 ] || [ -z "$target" ]; then
+    for d in "${GUFO_MODELS_DIRS[@]}"; do
+      [ -d "$d" ] || continue
+      while IFS= read -r f; do
+        while IFS= read -r hit; do pairs+=("$hit"); done < <(
+          jq -r --arg d "$(dirname "$f")" 'keys[] | $d + "\t" + .' "$f" 2>/dev/null)
+      done < <(find "$d" -maxdepth 3 -name "$GUFO_SOURCE_FILE" 2>/dev/null)
+    done
+  elif [ -f "$target" ] || [[ "$target" == */* ]]; then
+    path=$(resolve_model "$target") || die "model not found: $target (see: gufo models)"
+    hit=$(source_record_for "$path") ||
+      die "no download provenance for $path - copied-in models are not tracked"
+    pairs+=("$hit")
+  else
+    for d in "${GUFO_MODELS_DIRS[@]}"; do
+      [ -d "$d" ] || continue
+      while IFS= read -r f; do
+        jq -e --arg r "$target" '.[$r]' "$f" >/dev/null 2>&1 &&
+          pairs+=("$(dirname "$f")$TAB$target")
+      done < <(find "$d" -maxdepth 3 -name "$GUFO_SOURCE_FILE" 2>/dev/null)
+    done
+  fi
+  (( ${#pairs[@]} > 0 )) ||
+    die "nothing to check: no $GUFO_SOURCE_FILE under ${GUFO_MODELS_DIRS[*]} (see: gufo download)"
+
+  local found=0 entry dir recipe repo rev line status head changed missing fpath hubb
+  local -a files=() newpairs=() keep=() dropped=()
+  for entry in "${pairs[@]}"; do
+    dir="${entry%%$TAB*}"; recipe="${entry##*$TAB}"
+    repo=$(jq -r --arg r "$recipe" '.[$r].repo // empty' "$dir/$GUFO_SOURCE_FILE")
+    rev=$(jq -r --arg r "$recipe" '.[$r].revision // empty' "$dir/$GUFO_SOURCE_FILE")
+    line=$(check_record "$dir" "$recipe" 1 10) || continue
+    IFS=$'\t' read -r status head changed missing <<<"$line"
+    found=1
+    if [ "$status" = "unknown" ]; then
+      warn "$recipe ($repo): could not reach $GUFO_HUB - not checked"
+      continue
+    fi
+    if [ "$status" = "current" ]; then
+      ok "$recipe ($repo): up to date at ${rev:0:10}"
+      continue
+    fi
+    warn "$recipe ($repo): local ${rev:0:10} -> Hub ${head:0:10}"
+    info "   tracked files with a different size: ${changed:-0}; no longer on the Hub: ${missing:-0}"
+    if [ "$apply" != 1 ] && ! { [ -t 0 ] && confirm "fetch ${head:0:10} into $dir?"; }; then
+      info "   skipped - run 'gufo updates $recipe --apply' to upgrade"
+      continue
+    fi
+    command -v hf >/dev/null || die "the upgrade needs the 'hf' CLI"
+    mapfile -t files < <(jq -r --arg r "$recipe" '.[$r].files[]?.path' "$dir/$GUFO_SOURCE_FILE")
+    (( ${#files[@]} > 0 )) || die "record for '$recipe' tracks no files"
+    # A file the newer commit dropped cannot be fetched from it, so leave it out of
+    # the fetch and out of the record instead of failing the whole upgrade.
+    declare -A hub_bytes=()
+    while IFS=$'\t' read -r fpath hubb; do hub_bytes["$fpath"]="$hubb"; done < <(hub_files "$repo" "$head")
+    keep=(); dropped=()
+    for fpath in "${files[@]}"; do
+      if [ -n "${hub_bytes[$fpath]+set}" ]; then keep+=("$fpath"); else dropped+=("$fpath"); fi
+    done
+    (( ${#dropped[@]} > 0 )) &&
+      warn "   ${#dropped[@]} tracked file(s) are not in ${head:0:10} and will stop being tracked: ${dropped[*]}"
+    (( ${#keep[@]} > 0 )) || die "nothing left to fetch from ${head:0:10} for '$recipe'"
+    info "upgrading $recipe to $head (${#keep[@]} file(s))"
+    HF_HUB_DISABLE_XET=1 hf download "$repo" --revision "$head" "${keep[@]}" --local-dir "$dir" ||
+      die "download failed; $dir still records ${rev:0:10}"
+    # Record the bytes we actually hold now, not the ones the old commit had, so
+    # the next check compares the Hub against reality.
+    newpairs=()
+    for fpath in "${keep[@]}"; do
+      newpairs+=("$fpath:$(stat -c %s "$dir/$fpath" 2>/dev/null || echo 0)")
+    done
+    record_source "$dir" "$recipe" "$repo" "$head" "${newpairs[@]}"
+    cache_record "$dir/$GUFO_SOURCE_FILE" "$recipe" current "$head" 0 0 || true
+    ok "$recipe upgraded to ${head:0:10} - restart any running container to pick it up"
+  done
+  [ "$found" = 1 ] || die "no provenance record matched '${target:---all}'"
+}
+
 cmd_download() {
   local recipe="${1:-}"
   local hf_repo hf_rev dest min_free_gib
@@ -1165,6 +1423,9 @@ cmd_download() {
   done
   (( fail == 0 )) || die "size verification failed under $dest"
 
+  record_source "$dest" "$recipe" "$hf_repo" "$hf_rev" "${expect[@]}"
+  info "recorded provenance in $dest/$GUFO_SOURCE_FILE (gufo updates checks this against the Hub)"
+
   case "$recipe" in
     flash-next)  ok "ready: gufo run flash-next --ctx 32768  (stop other models first: 115 GB weights; it attaches the projector and registers input: [text, image])" ;;
     dflash2-27b) ok "ready: gufo run 27b  will now auto-enable DFlash2" ;;
@@ -1227,7 +1488,11 @@ usage: gufo <command> [args]
   download <flash-next|dflash2-27b>
                                   fetch a verified model + its speculative sidecar from
                                   Hugging Face (needs the 'hf' CLI; resumable; checks free
-                                  disk: flash-next ~120 GB, dflash2-27b ~1 GB)
+                                  disk: flash-next ~120 GB, dflash2-27b ~1 GB); records
+                                  where the files came from for 'updates'
+  updates [--all|model] [--apply] compare downloaded models against the Hub and upgrade
+                                  them; 'run' prints the same check from a cache
+                                  (GUFO_UPDATE_CHECK=0 disables, GUFO_UPDATE_TTL=secs)
 
 models dirs:   ${GUFO_MODELS_DIRS[*]}
 models.json:   $PI_MODELS_JSON
@@ -1251,6 +1516,7 @@ case "$cmd" in
   unregister)  cmd_unregister "$@" ;;
   diagnose)    cmd_diagnose "$@" ;;
   download)    cmd_download "$@" ;;
+  updates)     cmd_updates "$@" ;;
   help|-h|--help) usage ;;
   *)           printf '%s\n' "unknown command: $cmd" >&2; usage; exit 1 ;;
 esac
